@@ -25,12 +25,13 @@ public final class ClaudeAgent: @unchecked Sendable {
     private let logger = PhoneBTLogger(category: .agent)
 
     private var conversationHistory: [MessageParameter.Message] = []
-    private let model: Model = .claude37Sonnet
+    private let model: Model = .other("claude-sonnet-4-6")
 
     private let systemPrompt = """
-        You are a phone call assistant. You can make and receive phone calls through \
-        a Bluetooth-connected phone. You have tools to dial numbers, accept/end calls, \
-        send DTMF tones, check call/phone status, and speak to callers.
+        You are a phone call assistant resposible to make doctor appointments. \
+        You can make phone calls through a Bluetooth-connected phone. \
+        You have tools to dial numbers and end calls, check call/phone status, \
+        and speak to callers.
 
         When a user asks you to call someone, use the dial_number tool. \
         When an incoming call arrives, inform the user and ask if they want to answer. \
@@ -132,43 +133,48 @@ public final class ClaudeAgent: @unchecked Sendable {
                 tools: PhoneTools.allTools
             )
 
-            let response = try await service.createMessage(parameters)
-
-            // Convert response content to message content objects for history
-            let contentObjects = response.content.map { responseContentToMessageContent($0) }
-            conversationHistory.append(
-                .init(role: .assistant, content: .list(contentObjects))
-            )
-
-            // Check if we need to handle tool calls
-            if response.stopReason == "tool_use" {
-                var toolResults: [MessageParameter.Message.Content.ContentObject] = []
-
-                for content in response.content {
-                    if case .toolUse(let toolUse) = content {
-                        logger.info("Tool call: \(toolUse.name)")
-
-                        // Convert DynamicContent input to [String: Any]
-                        let inputDict = dynamicContentToDict(toolUse.input)
-                        let result = toolExecutor.execute(toolName: toolUse.name, input: inputDict)
-
-                        toolResults.append(
-                            .toolResult(toolUse.id, result)
-                        )
-                    }
-                }
-
-                // Add tool results as user message
+            do {
+                let response = try await service.createMessage(parameters)
+                
+                // Convert response content to message content objects for history
+                let contentObjects = response.content.map { responseContentToMessageContent($0) }
                 conversationHistory.append(
-                    .init(role: .user, content: .list(toolResults))
+                    .init(role: .assistant, content: .list(contentObjects))
                 )
 
-                // Continue the loop to get the model's response to tool results
-                continue
-            }
+                // Check if we need to handle tool calls
+                if response.stopReason == "tool_use" {
+                    var toolResults: [MessageParameter.Message.Content.ContentObject] = []
 
-            // No more tool calls — extract text response
-            return extractTextResponse(from: response.content)
+                    for content in response.content {
+                        if case .toolUse(let toolUse) = content {
+                            logger.info("Tool call: \(toolUse.name)")
+
+                            // Convert DynamicContent input to [String: Any]
+                            let inputDict = dynamicContentToDict(toolUse.input)
+                            let result = toolExecutor.execute(toolName: toolUse.name, input: inputDict)
+
+                            toolResults.append(
+                                .toolResult(toolUse.id, result)
+                            )
+                        }
+                    }
+
+                    // Add tool results as user message
+                    conversationHistory.append(
+                        .init(role: .user, content: .list(toolResults))
+                    )
+
+                    // Continue the loop to get the model's response to tool results
+                    continue
+                }
+
+                // No more tool calls — extract text response
+                return extractTextResponse(from: response.content)
+            } catch {
+                self.logger.error("\(error)")
+                throw error
+            }
         }
 
         return "Agent reached maximum iterations without completing."

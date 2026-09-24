@@ -30,12 +30,14 @@ In AI agent mode, Claude controls the phone through a tool-use conversation loop
 
 ```bash
 swift build
+swift build --build-system native
 ```
 
 ## Running
 
 ```bash
 swift run PhoneBT
+swift run --build-system native PhoneBT
 ```
 
 ### Interactive CLI
@@ -47,7 +49,7 @@ phonebt> dial +15551234567 # Place a call
 phonebt> answer           # Answer an incoming call
 phonebt> hangup           # End the current call
 phonebt> dtmf 1           # Send a DTMF tone
-phonebt> status           # Show call status
+phonebt> status           # Show call statussw
 phonebt> phone            # Show phone status (signal, battery, carrier)
 phonebt> audio            # List Bluetooth audio devices
 phonebt> agent            # Enter AI agent mode
@@ -134,6 +136,12 @@ swift test
 ```
 
 30 tests covering the HFP state machine and tool executor (including `say_to_caller`).
+
+## Debug Logs
+
+```bash
+log stream --level debug --predicate 'subsystem == "com.phonebt"
+```
 
 ## Known Limitations
 

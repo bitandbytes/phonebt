@@ -26,9 +26,9 @@ func printBanner() {
     print("""
 
     ╔══════════════════════════════════════╗
-    ║          PhoneBT v0.1.0             ║
-    ║  Bluetooth HFP Client for macOS    ║
-    ║  AI-Driven Phone Call Management   ║
+    ║          PhoneBT v0.1.0              ║
+    ║  Bluetooth HFP Client for macOS      ║
+    ║  AI-Driven Phone Call Management     ║
     ╚══════════════════════════════════════╝
     """)
 }
@@ -67,6 +67,7 @@ var isRunning = true
 var audioSessionManager: AudioSessionManager?
 var audioCapture: AudioCapture?
 var ttsPlayer: TTSPlayer?
+var scoConnectTask: Task<Void, Never>?
 
 // MARK: - Signal Handling
 
@@ -158,14 +159,17 @@ func handleConnect(indexStr: String) async {
 
 // MARK: - Audio Pipeline
 
-func startAudioPipeline() {
-    guard let device = hfpDevice else { return }
+func startAudioPipeline() -> Bool {
+    guard let device = hfpDevice else {
+        logger.error("HFP Device is not available")
+        return false
+    }
 
     let deviceManager = AudioDeviceManager()
     let btDevices = deviceManager.getBluetoothDevices()
     guard let scoDevice = btDevices.first(where: { $0.hasInput && $0.hasOutput }) else {
         logger.error("No Bluetooth SCO device found for audio pipeline")
-        return
+        return false
     }
 
     let session = AudioSessionManager()
@@ -174,7 +178,7 @@ func startAudioPipeline() {
         try session.start()
     } catch {
         logger.error("Failed to start audio session: \(error)")
-        return
+        return false
     }
     audioSessionManager = session
 
@@ -199,6 +203,40 @@ func startAudioPipeline() {
     }
 
     logger.info("Audio pipeline started for device: \(scoDevice.name)")
+    return true
+}
+
+/// The Bluetooth SCO CoreAudio device is published by the HAL asynchronously,
+/// often a second or two after the SCO link opens — poll for it before
+/// routing audio and starting the pipeline.
+func startAudioWhenSCODeviceAppears(attempts: Int = 20, delay: Duration = .milliseconds(500)) async {
+    let deviceManager = AudioDeviceManager()
+    for _ in 1...attempts {
+        if Task.isCancelled { return }
+
+        if deviceManager.getBluetoothDevices().contains(where: { $0.hasInput && $0.hasOutput }) {
+            if audioRouter.routeToBluetoothDevice() {
+                print("BT Routing Started")
+            } else {
+                print("⚠️  Failed to route system audio to the Bluetooth device")
+            }
+            if startAudioPipeline() {
+                print("BT Audio Pipeline Started")
+            } else {
+                print("⚠️  Audio pipeline failed to start — check the com.phonebt log")
+            }
+            return
+        }
+
+        try? await Task.sleep(for: delay)
+    }
+
+    print("\n⚠️  No Bluetooth SCO audio device appeared — audio pipeline not started")
+    let devices = deviceManager.getAllDevices()
+    logger.error("CoreAudio devices visible (\(devices.count)):")
+    for device in devices {
+        logger.error("  \(device.name) [transport=\(device.transportTypeDescription), in=\(device.hasInput), out=\(device.hasOutput)]")
+    }
 }
 
 func stopAudioPipeline() {
@@ -221,16 +259,22 @@ func handleEvent(_ event: HFPEvent) {
         print("\n📱 Call active")
     case .scoConnected:
         print("\n🔊 Audio connected")
-        _ = audioRouter.routeToBluetoothDevice()
-        startAudioPipeline()
+        scoConnectTask?.cancel()
+        scoConnectTask = Task {
+            await startAudioWhenSCODeviceAppears()
+        }
     case .scoDisconnected:
         print("\n🔇 Audio disconnected")
+        scoConnectTask?.cancel()
+        scoConnectTask = nil
         stopAudioPipeline()
         audioRouter.restorePreviousRouting()
     case .callerSpeech(let text):
         print("\n🗣️  Caller: \"\(text)\"")
     case .disconnected:
         print("\n⚠️  Device disconnected")
+        scoConnectTask?.cancel()
+        scoConnectTask = nil
         stopAudioPipeline()
         hfpDevice = nil
     default:

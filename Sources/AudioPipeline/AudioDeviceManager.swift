@@ -29,6 +29,21 @@ public struct AudioDeviceInfo: Sendable {
         return transportType == kAudioDeviceTransportTypeBluetooth
             || transportType == kAudioDeviceTransportTypeBluetoothLE
     }
+
+    /// Transport type as its four-character code (e.g. "blue", "usb "), for diagnostics.
+    public var transportTypeDescription: String {
+        let bytes = [
+            UInt8((transportType >> 24) & 0xFF),
+            UInt8((transportType >> 16) & 0xFF),
+            UInt8((transportType >> 8) & 0xFF),
+            UInt8(transportType & 0xFF)
+        ]
+        if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }),
+           let code = String(bytes: bytes, encoding: .ascii) {
+            return code
+        }
+        return String(transportType)
+    }
 }
 
 public final class AudioDeviceManager: Sendable {

@@ -55,6 +55,8 @@ public final class AudioRouter: @unchecked Sendable {
                 logger.error("Failed to route audio to Bluetooth")
             }
             return isRouted
+        } else {
+            logger.warning("No BT device found with input and output devices")
         }
 
         // Fall back to separate input/output BT devices
