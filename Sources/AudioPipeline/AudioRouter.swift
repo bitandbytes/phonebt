@@ -16,62 +16,57 @@ import Foundation
 import CoreAudio
 import Shared
 
-/// Routes audio between SCO Bluetooth connection and system audio devices
+/// Routes system audio to the device carrying phone-call audio
+/// (a USB audio adapter by default, or a Bluetooth SCO device as fallback).
 public final class AudioRouter: @unchecked Sendable {
     private let deviceManager: AudioDeviceManager
+    private let preferredDeviceName: String?
     private let logger = PhoneBTLogger(category: .audio)
 
     private var previousOutputDevice: AudioDeviceID?
     private var previousInputDevice: AudioDeviceID?
     private var isRouted = false
 
-    public init(deviceManager: AudioDeviceManager = AudioDeviceManager()) {
+    public init(deviceManager: AudioDeviceManager = AudioDeviceManager(), preferredDeviceName: String? = nil) {
         self.deviceManager = deviceManager
+        self.preferredDeviceName = preferredDeviceName
     }
 
-    /// Route audio to Bluetooth device when SCO connection opens
-    public func routeToBluetoothDevice() -> Bool {
-        let btDevices = deviceManager.getBluetoothDevices()
+    /// The device phone-call audio is resolved to, if currently present.
+    public func callAudioDevice() -> AudioDeviceInfo? {
+        return deviceManager.findCallAudioDevice(preferredName: preferredDeviceName)
+    }
 
-        guard !btDevices.isEmpty else {
-            logger.error("No Bluetooth audio devices found for routing")
+    /// Route system default input/output to the call audio device.
+    public func routeToCallAudioDevice() -> Bool {
+        guard let device = callAudioDevice() else {
+            logger.error("No call audio device found for routing (preferred: \(preferredDeviceName ?? "none"))")
             return false
         }
 
-        // Save current defaults for restoration
-        previousOutputDevice = deviceManager.getDefaultOutputDevice()
-        previousInputDevice = deviceManager.getDefaultInputDevice()
+        // Save current defaults for restoration (only once per routing session)
+        if !isRouted {
+            previousOutputDevice = deviceManager.getDefaultOutputDevice()
+            previousInputDevice = deviceManager.getDefaultInputDevice()
+        }
 
-        // Find a BT device with both input and output (SCO device)
-        if let scoDevice = btDevices.first(where: { $0.hasInput && $0.hasOutput }) {
-            logger.info("Routing audio to SCO device: \(scoDevice.name) [\(scoDevice.id)]")
-            let outOk = deviceManager.setDefaultOutputDevice(scoDevice.id)
-            let inOk = deviceManager.setDefaultInputDevice(scoDevice.id)
-            isRouted = outOk && inOk
+        logger.info("Routing audio to device: \(device.name) [\(device.id), \(device.transportTypeDescription)]")
+        let outOk = deviceManager.setDefaultOutputDevice(device.id)
+        let inOk = deviceManager.setDefaultInputDevice(device.id)
+        isRouted = outOk && inOk
 
-            if isRouted {
-                logger.info("Audio routed to Bluetooth successfully")
-            } else {
-                logger.error("Failed to route audio to Bluetooth")
-            }
-            return isRouted
+        if isRouted {
+            logger.info("Audio routed to \(device.name) successfully")
         } else {
-            logger.warning("No BT device found with input and output devices")
+            logger.error("Failed to route audio to \(device.name)")
         }
+        return isRouted
+    }
 
-        // Fall back to separate input/output BT devices
-        var routed = false
-        if let outputDevice = btDevices.first(where: { $0.hasOutput }) {
-            logger.info("Setting BT output: \(outputDevice.name)")
-            routed = deviceManager.setDefaultOutputDevice(outputDevice.id)
-        }
-        if let inputDevice = btDevices.first(where: { $0.hasInput }) {
-            logger.info("Setting BT input: \(inputDevice.name)")
-            routed = deviceManager.setDefaultInputDevice(inputDevice.id) && routed
-        }
-
-        isRouted = routed
-        return routed
+    /// Route audio to the call audio device when SCO connection opens.
+    /// Kept for compatibility; prefer `routeToCallAudioDevice()`.
+    public func routeToBluetoothDevice() -> Bool {
+        return routeToCallAudioDevice()
     }
 
     /// Restore previous audio routing when call ends
@@ -93,12 +88,17 @@ public final class AudioRouter: @unchecked Sendable {
         logger.info("Audio routing restored")
     }
 
-    /// List available Bluetooth audio devices (for debugging)
-    public func listBluetoothDevices() -> [AudioDeviceInfo] {
-        let devices = deviceManager.getBluetoothDevices()
+    /// List all audio devices (for debugging)
+    public func listAudioDevices() -> [AudioDeviceInfo] {
+        let devices = deviceManager.getAllDevices()
         for device in devices {
-            logger.info("BT Audio: \(device.name) [id=\(device.id), in=\(device.hasInput), out=\(device.hasOutput)]")
+            logger.info("Audio: \(device.name) [id=\(device.id), transport=\(device.transportTypeDescription), in=\(device.hasInput), out=\(device.hasOutput)]")
         }
         return devices
+    }
+
+    /// List available Bluetooth audio devices (for debugging)
+    public func listBluetoothDevices() -> [AudioDeviceInfo] {
+        return listAudioDevices().filter { $0.isBluetooth }
     }
 }

@@ -82,7 +82,7 @@ public final class ToolExecutor: @unchecked Sendable {
 
         // Route audio to computer
         try? device.transferAudioToComputer()
-        _ = audioRouter.routeToBluetoothDevice()
+        _ = audioRouter.routeToCallAudioDevice()
 
         return successJSON([
             "status": "answered",

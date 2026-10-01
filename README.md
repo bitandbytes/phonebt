@@ -25,6 +25,9 @@ In AI agent mode, Claude controls the phone through a tool-use conversation loop
 - Swift 5.9+
 - `ANTHROPIC_API_KEY` environment variable (for AI agent mode)
 - `ELEVENLABS_API_KEY` environment variable (optional, for TTS during calls)
+- A CoreAudio device carrying the call audio — by default a USB audio adapter named
+  "USB Advanced Audio Device". Override the name with `PHONEBT_AUDIO_DEVICE`
+  (case-insensitive substring match). A Bluetooth SCO device is used as fallback.
 
 ## Building
 
@@ -86,7 +89,7 @@ The agent automatically receives incoming call notifications and can answer or r
 
 ### Real-Time Voice Conversations
 
-When `ELEVENLABS_API_KEY` is set and a call is active with SCO audio connected, the audio pipeline starts automatically:
+When a call becomes active (or SCO audio connects), the audio pipeline starts automatically on the call audio device (see `PHONEBT_AUDIO_DEVICE`); TTS additionally requires `ELEVENLABS_API_KEY`:
 
 1. **Caller speech** is transcribed in real-time via Apple's on-device `SFSpeechRecognizer`
 2. Transcriptions appear as `[CALLER SPEECH]` events in agent mode

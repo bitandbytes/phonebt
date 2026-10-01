@@ -55,8 +55,13 @@ func printHelp() {
 
 // MARK: - Global State
 
+/// CoreAudio device carrying phone-call audio. Defaults to the USB audio adapter
+/// wired to the phone; override with PHONEBT_AUDIO_DEVICE (name substring match).
+/// Falls back to a Bluetooth SCO device if the named device is not present.
+let callAudioDeviceName = ProcessInfo.processInfo.environment["PHONEBT_AUDIO_DEVICE"] ?? "USB Advanced Audio Device"
+
 let bluetoothManager = BluetoothManager()
-let audioRouter = AudioRouter()
+let audioRouter = AudioRouter(preferredDeviceName: callAudioDeviceName)
 var hfpDevice: HFPDevice?
 var claudeAgent: ClaudeAgent?
 var eventListenerTask: Task<Void, Never>?
@@ -68,6 +73,7 @@ var audioSessionManager: AudioSessionManager?
 var audioCapture: AudioCapture?
 var ttsPlayer: TTSPlayer?
 var scoConnectTask: Task<Void, Never>?
+var activeAudioDevice: AudioDeviceInfo?
 
 // MARK: - Signal Handling
 
@@ -159,28 +165,36 @@ func handleConnect(indexStr: String) async {
 
 // MARK: - Audio Pipeline
 
+var isAudioPipelineRunning: Bool {
+    return audioSessionManager != nil
+}
+
 func startAudioPipeline() -> Bool {
     guard let device = hfpDevice else {
         logger.error("HFP Device is not available")
         return false
     }
 
-    let deviceManager = AudioDeviceManager()
-    let btDevices = deviceManager.getBluetoothDevices()
-    guard let scoDevice = btDevices.first(where: { $0.hasInput && $0.hasOutput }) else {
-        logger.error("No Bluetooth SCO device found for audio pipeline")
+    guard !isAudioPipelineRunning else {
+        logger.info("Audio pipeline already running")
+        return true
+    }
+
+    guard let audioDevice = audioRouter.callAudioDevice() else {
+        logger.error("No call audio device found for audio pipeline (preferred: \(callAudioDeviceName))")
         return false
     }
 
     let session = AudioSessionManager()
     do {
-        try session.configure(deviceUID: scoDevice.uid)
+        try session.configure(deviceID: audioDevice.id)
         try session.start()
     } catch {
         logger.error("Failed to start audio session: \(error)")
         return false
     }
     audioSessionManager = session
+    activeAudioDevice = audioDevice
 
     // Set up STT capture
     let capture = AudioCapture(sessionManager: session)
@@ -202,26 +216,28 @@ func startAudioPipeline() -> Bool {
         logger.info("ELEVENLABS_API_KEY not set — TTS disabled")
     }
 
-    logger.info("Audio pipeline started for device: \(scoDevice.name)")
+    logger.info("Audio pipeline started for device: \(audioDevice.name)")
     return true
 }
 
-/// The Bluetooth SCO CoreAudio device is published by the HAL asynchronously,
-/// often a second or two after the SCO link opens — poll for it before
-/// routing audio and starting the pipeline.
-func startAudioWhenSCODeviceAppears(attempts: Int = 20, delay: Duration = .milliseconds(500)) async {
-    let deviceManager = AudioDeviceManager()
+/// Route system audio to the call audio device and start the pipeline.
+/// The device is usually present immediately (USB adapter), but a Bluetooth SCO
+/// fallback device is published asynchronously — so poll briefly before giving up.
+func startAudioWhenDeviceAppears(attempts: Int = 20, delay: Duration = .milliseconds(500)) async {
+    guard !isAudioPipelineRunning else { return }
+
     for _ in 1...attempts {
         if Task.isCancelled { return }
 
-        if deviceManager.getBluetoothDevices().contains(where: { $0.hasInput && $0.hasOutput }) {
-            if audioRouter.routeToBluetoothDevice() {
-                print("BT Routing Started")
+        if let audioDevice = audioRouter.callAudioDevice() {
+            print("🎧 Call audio device: \(audioDevice.name) [\(audioDevice.transportTypeDescription)]")
+            if audioRouter.routeToCallAudioDevice() {
+                print("Audio Routing Started")
             } else {
-                print("⚠️  Failed to route system audio to the Bluetooth device")
+                print("⚠️  Failed to route system audio to \(audioDevice.name)")
             }
             if startAudioPipeline() {
-                print("BT Audio Pipeline Started")
+                print("Audio Pipeline Started")
             } else {
                 print("⚠️  Audio pipeline failed to start — check the com.phonebt log")
             }
@@ -231,8 +247,8 @@ func startAudioWhenSCODeviceAppears(attempts: Int = 20, delay: Duration = .milli
         try? await Task.sleep(for: delay)
     }
 
-    print("\n⚠️  No Bluetooth SCO audio device appeared — audio pipeline not started")
-    let devices = deviceManager.getAllDevices()
+    print("\n⚠️  Call audio device \"\(callAudioDeviceName)\" not found — audio pipeline not started")
+    let devices = AudioDeviceManager().getAllDevices()
     logger.error("CoreAudio devices visible (\(devices.count)):")
     for device in devices {
         logger.error("  \(device.name) [transport=\(device.transportTypeDescription), in=\(device.hasInput), out=\(device.hasOutput)]")
@@ -245,7 +261,22 @@ func stopAudioPipeline() {
     audioSessionManager?.stop()
     audioSessionManager = nil
     ttsPlayer = nil
+    activeAudioDevice = nil
     logger.info("Audio pipeline stopped")
+}
+
+/// Start call audio (routing + pipeline) in the background, once.
+/// Safe to call from several events (`.callActive`, `.scoConnected`) — a
+/// pending or completed start is not repeated.
+func startCallAudio() {
+    guard !isAudioPipelineRunning else { return }
+    if let task = scoConnectTask, !task.isCancelled { return }  // attempt already in progress
+
+    // Run on the main actor so overlapping events can't start two pipelines.
+    scoConnectTask = Task { @MainActor in
+        await startAudioWhenDeviceAppears()
+        if !Task.isCancelled { scoConnectTask = nil }
+    }
 }
 
 func handleEvent(_ event: HFPEvent) {
@@ -255,20 +286,30 @@ func handleEvent(_ event: HFPEvent) {
         print("Type 'answer' to accept or 'hangup' to reject")
     case .callEnded:
         print("\n📱 Call ended")
-    case .callActive:
-        print("\n📱 Call active")
-    case .scoConnected:
-        print("\n🔊 Audio connected")
-        scoConnectTask?.cancel()
-        scoConnectTask = Task {
-            await startAudioWhenSCODeviceAppears()
-        }
-    case .scoDisconnected:
-        print("\n🔇 Audio disconnected")
         scoConnectTask?.cancel()
         scoConnectTask = nil
         stopAudioPipeline()
         audioRouter.restorePreviousRouting()
+    case .callActive:
+        print("\n📱 Call active")
+        // With a wired USB audio adapter the call audio is available as soon as
+        // the call is active, independent of the Mac's own SCO link.
+        startCallAudio()
+    case .scoConnected:
+        print("\n🔊 Audio connected")
+        startCallAudio()
+    case .scoDisconnected:
+        print("\n🔇 Audio disconnected")
+        if let active = activeAudioDevice, !active.isBluetooth,
+           hfpDevice?.currentState.call == .active {
+            // Call audio is on a wired device; the Mac's SCO link dropping doesn't affect it.
+            print("Call still active on \(active.name) — keeping audio pipeline running")
+        } else {
+            scoConnectTask?.cancel()
+            scoConnectTask = nil
+            stopAudioPipeline()
+            audioRouter.restorePreviousRouting()
+        }
     case .callerSpeech(let text):
         print("\n🗣️  Caller: \"\(text)\"")
     case .disconnected:
@@ -369,14 +410,19 @@ func handlePhoneStatus() {
 }
 
 func handleAudioDevices() {
-    let devices = audioRouter.listBluetoothDevices()
+    let devices = audioRouter.listAudioDevices()
+    let selected = audioRouter.callAudioDevice()
     if devices.isEmpty {
-        print("No Bluetooth audio devices found.")
+        print("No audio devices found.")
     } else {
-        print("Bluetooth audio devices:")
+        print("Audio devices (call audio device marked with *):")
         for device in devices {
-            print("  \(device.name) [id=\(device.id), in=\(device.hasInput), out=\(device.hasOutput)]")
+            let marker = device.id == selected?.id ? "* " : "  "
+            print("\(marker)\(device.name) [id=\(device.id), transport=\(device.transportTypeDescription), in=\(device.hasInput), out=\(device.hasOutput)]")
         }
+    }
+    if selected == nil {
+        print("⚠️  Call audio device \"\(callAudioDeviceName)\" not found (set PHONEBT_AUDIO_DEVICE to override).")
     }
 }
 

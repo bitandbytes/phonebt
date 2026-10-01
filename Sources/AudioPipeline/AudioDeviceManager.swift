@@ -30,6 +30,10 @@ public struct AudioDeviceInfo: Sendable {
             || transportType == kAudioDeviceTransportTypeBluetoothLE
     }
 
+    public var isUSB: Bool {
+        return transportType == kAudioDeviceTransportTypeUSB
+    }
+
     /// Transport type as its four-character code (e.g. "blue", "usb "), for diagnostics.
     public var transportTypeDescription: String {
         let bytes = [
@@ -92,6 +96,28 @@ public final class AudioDeviceManager: Sendable {
     /// Find Bluetooth audio devices
     public func getBluetoothDevices() -> [AudioDeviceInfo] {
         return getAllDevices().filter { $0.isBluetooth }
+    }
+
+    /// Find a device whose name contains `name` (case-insensitive).
+    /// Prefers a device that has both input and output.
+    public func findDevice(named name: String) -> AudioDeviceInfo? {
+        let matches = getAllDevices().filter {
+            $0.name.range(of: name, options: .caseInsensitive) != nil
+        }
+        return matches.first(where: { $0.hasInput && $0.hasOutput }) ?? matches.first
+    }
+
+    /// Resolve the device that carries phone-call audio.
+    ///
+    /// Looks for a full-duplex device matching `preferredName` first (e.g. a USB
+    /// audio adapter wired to the phone), then falls back to a Bluetooth SCO
+    /// device with both input and output.
+    public func findCallAudioDevice(preferredName: String?) -> AudioDeviceInfo? {
+        if let name = preferredName, !name.isEmpty,
+           let device = findDevice(named: name), device.hasInput, device.hasOutput {
+            return device
+        }
+        return getBluetoothDevices().first(where: { $0.hasInput && $0.hasOutput })
     }
 
     /// Get the current default output device

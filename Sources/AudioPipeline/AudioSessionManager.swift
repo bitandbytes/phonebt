@@ -30,24 +30,32 @@ public final class AudioSessionManager: @unchecked Sendable {
         engine.attach(playerNode)
     }
 
-    /// Configure engine to use specific input/output devices by UID
-    public func configure(inputDeviceUID: String, outputDeviceUID: String) throws {
+    /// Configure engine to use specific input/output devices by CoreAudio device ID
+    public func configure(inputDeviceID: AudioDeviceID, outputDeviceID: AudioDeviceID) throws {
         let inputUnit = engine.inputNode.audioUnit!
         let outputUnit = engine.outputNode.audioUnit!
 
-        try setDeviceUID(inputDeviceUID, on: inputUnit)
-        try setDeviceUID(outputDeviceUID, on: outputUnit)
+        try setDevice(inputDeviceID, on: inputUnit)
+        try setDevice(outputDeviceID, on: outputUnit)
 
         // Connect player node to output
         let outputFormat = engine.outputNode.inputFormat(forBus: 0)
         engine.connect(playerNode, to: engine.mainMixerNode, format: outputFormat)
 
-        logger.info("Audio engine configured — input: \(inputDeviceUID), output: \(outputDeviceUID)")
+        logger.info("Audio engine configured — input: \(inputDeviceID), output: \(outputDeviceID)")
     }
 
-    /// Configure engine targeting a single BT SCO device for both input and output
+    /// Configure engine targeting a single full-duplex device for both input and output
+    public func configure(deviceID: AudioDeviceID) throws {
+        try configure(inputDeviceID: deviceID, outputDeviceID: deviceID)
+    }
+
+    /// Configure engine targeting a single device looked up by UID
     public func configure(deviceUID: String) throws {
-        try configure(inputDeviceUID: deviceUID, outputDeviceUID: deviceUID)
+        guard let device = AudioDeviceManager().getAllDevices().first(where: { $0.uid == deviceUID }) else {
+            throw AudioSessionError.deviceNotFound(deviceUID)
+        }
+        try configure(deviceID: device.id)
     }
 
     public func start() throws {
@@ -73,15 +81,17 @@ public final class AudioSessionManager: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func setDeviceUID(_ uid: String, on audioUnit: AudioUnit) throws {
-        var cfUID = uid as CFString
+    /// `kAudioOutputUnitProperty_CurrentDevice` takes an `AudioDeviceID`
+    /// (passing a UID string fails with kAudioUnitErr_InvalidPropertyValue).
+    private func setDevice(_ deviceID: AudioDeviceID, on audioUnit: AudioUnit) throws {
+        var id = deviceID
         let status = AudioUnitSetProperty(
             audioUnit,
             kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global,
             0,
-            &cfUID,
-            UInt32(MemoryLayout<CFString>.size)
+            &id,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
         )
         guard status == noErr else {
             throw AudioSessionError.deviceConfigFailed(status)
@@ -91,11 +101,14 @@ public final class AudioSessionManager: @unchecked Sendable {
 
 public enum AudioSessionError: Error, LocalizedError {
     case deviceConfigFailed(OSStatus)
+    case deviceNotFound(String)
 
     public var errorDescription: String? {
         switch self {
         case .deviceConfigFailed(let status):
             return "Failed to configure audio device (OSStatus \(status))"
+        case .deviceNotFound(let uid):
+            return "Audio device not found: \(uid)"
         }
     }
 }
