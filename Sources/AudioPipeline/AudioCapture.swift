@@ -18,7 +18,7 @@ import Speech
 import Shared
 
 /// Captures audio from AVAudioEngine input and transcribes using Apple SFSpeechRecognizer
-public final class AudioCapture: @unchecked Sendable {
+public final class AudioCapture: @unchecked Sendable, STTProvider {
     private let sessionManager: AudioSessionManager
     private let speechRecognizer: SFSpeechRecognizer
     private let logger = PhoneBTLogger(category: .audio)

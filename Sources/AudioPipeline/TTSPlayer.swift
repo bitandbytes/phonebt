@@ -17,20 +17,43 @@ import AVFoundation
 import Shared
 
 /// Plays TTS audio via ElevenLabs API through the shared AVAudioEngine
-public final class TTSPlayer: @unchecked Sendable {
+public final class TTSPlayer: @unchecked Sendable, TTSProvider {
     private let sessionManager: AudioSessionManager
-    private let apiKey: String
-    private let voiceID: String
+    private var apiKey: String
+    private var voiceID: String
+    private var modelID: String
     private let logger = PhoneBTLogger(category: .audio)
     private let urlSession = URLSession.shared
+    private let lock = NSLock()
 
     private let sampleRate: Double = 16000
     private let outputFormat = "pcm_16000"
 
-    public init(sessionManager: AudioSessionManager, apiKey: String, voiceID: String = "21m00Tcm4TlvDq8ikWAM") {
+    public init(
+        sessionManager: AudioSessionManager,
+        apiKey: String,
+        voiceID: String = "21m00Tcm4TlvDq8ikWAM",
+        modelID: String = "eleven_turbo_v2"
+    ) {
         self.sessionManager = sessionManager
         self.apiKey = apiKey
         self.voiceID = voiceID
+        self.modelID = modelID
+    }
+
+    public func setVoiceID(_ id: String) {
+        lock.lock(); defer { lock.unlock() }
+        voiceID = id
+    }
+
+    public func setModelID(_ id: String) {
+        lock.lock(); defer { lock.unlock() }
+        modelID = id
+    }
+
+    public func setAPIKey(_ key: String) {
+        lock.lock(); defer { lock.unlock() }
+        apiKey = key
     }
 
     /// Synthesize and play text through the audio engine's player node
@@ -61,7 +84,13 @@ public final class TTSPlayer: @unchecked Sendable {
     // MARK: - Private
 
     private func synthesize(_ text: String) async throws -> Data {
-        let urlString = "https://api.elevenlabs.io/v1/text-to-speech/\(voiceID)/stream?output_format=\(outputFormat)"
+        lock.lock()
+        let currentVoiceID = voiceID
+        let currentModelID = modelID
+        let currentAPIKey = apiKey
+        lock.unlock()
+
+        let urlString = "https://api.elevenlabs.io/v1/text-to-speech/\(currentVoiceID)/stream?output_format=\(outputFormat)"
         guard let url = URL(string: urlString) else {
             throw TTSError.invalidURL
         }
@@ -69,11 +98,11 @@ public final class TTSPlayer: @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+        request.setValue(currentAPIKey, forHTTPHeaderField: "xi-api-key")
 
         let body: [String: Any] = [
             "text": text,
-            "model_id": "eleven_turbo_v2",
+            "model_id": currentModelID,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 

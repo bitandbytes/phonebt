@@ -109,15 +109,14 @@ public final class AudioDeviceManager: Sendable {
 
     /// Resolve the device that carries phone-call audio.
     ///
-    /// Looks for a full-duplex device matching `preferredName` first (e.g. a USB
-    /// audio adapter wired to the phone), then falls back to a Bluetooth SCO
-    /// device with both input and output.
+    /// Returns the full-duplex device matching `preferredName` (e.g. a USB
+    /// audio adapter wired to the phone), or `nil` if no match is found.
     public func findCallAudioDevice(preferredName: String?) -> AudioDeviceInfo? {
         if let name = preferredName, !name.isEmpty,
            let device = findDevice(named: name), device.hasInput, device.hasOutput {
             return device
         }
-        return getBluetoothDevices().first(where: { $0.hasInput && $0.hasOutput })
+        return nil
     }
 
     /// Get the current default output device

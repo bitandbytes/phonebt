@@ -13,22 +13,45 @@
 // limitations under the License.
 
 import Foundation
-import SwiftAnthropic
 import HFPCore
 import Shared
 
-/// Claude AI agent that manages phone calls via tool-use conversation loop
+private actor AgentRequestGate {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isLocked = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
+/// AI agent that manages phone calls via tool-use conversation loop
 public final class ClaudeAgent: @unchecked Sendable {
-    private let service: AnthropicService
+    private let llmService: any LLMService
     private let toolExecutor: ToolExecutor
     private let eventStream: HFPEventStream
     private let logger = PhoneBTLogger(category: .agent)
+    private let requestGate = AgentRequestGate()
 
-    private var conversationHistory: [MessageParameter.Message] = []
-    private let model: Model = .other("claude-sonnet-4-6")
+    private var conversationHistory: [LLMMessage] = []
 
     private let systemPrompt = """
-        You are a phone call assistant resposible to make doctor appointments. \
+        You are a phone call assistant responsible to make doctor appointments. \
         You can make phone calls through a Bluetooth-connected phone. \
         You have tools to dial numbers and end calls, check call/phone status, \
         and speak to callers.
@@ -45,29 +68,43 @@ public final class ClaudeAgent: @unchecked Sendable {
         Be concise in your responses. Report tool results clearly.
         """
 
-    public init(apiKey: String, toolExecutor: ToolExecutor, eventStream: HFPEventStream) {
-        self.service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: nil)
+    public init(llmService: any LLMService, toolExecutor: ToolExecutor, eventStream: HFPEventStream) {
+        self.llmService = llmService
         self.toolExecutor = toolExecutor
         self.eventStream = eventStream
     }
 
     /// Process a user message through the agent loop, returning the final text response
     public func processMessage(_ userMessage: String) async throws -> String {
-        conversationHistory.append(
-            .init(role: .user, content: .text(userMessage))
-        )
-
-        return try await runAgentLoop()
+        await requestGate.acquire()
+        do {
+            conversationHistory.append(
+                LLMMessage(role: .user, content: [.text(userMessage)])
+            )
+            let response = try await runAgentLoop()
+            await requestGate.release()
+            return response
+        } catch {
+            await requestGate.release()
+            throw error
+        }
     }
 
     /// Inject a system event (e.g., incoming call notification) into the conversation
     public func injectEvent(_ eventDescription: String) async throws -> String {
-        let message = "[PHONE EVENT] \(eventDescription)"
-        conversationHistory.append(
-            .init(role: .user, content: .text(message))
-        )
-
-        return try await runAgentLoop()
+        await requestGate.acquire()
+        do {
+            let message = "[PHONE EVENT] \(eventDescription)"
+            conversationHistory.append(
+                LLMMessage(role: .user, content: [.text(message)])
+            )
+            let response = try await runAgentLoop()
+            await requestGate.release()
+            return response
+        } catch {
+            await requestGate.release()
+            throw error
+        }
     }
 
     /// Start listening for HFP events and forwarding them to the agent
@@ -92,12 +129,11 @@ public final class ClaudeAgent: @unchecked Sendable {
                     description = "Audio disconnected"
                 case .callerSpeech(let text):
                     description = nil
-                    // Handle caller speech as a special injection
                     do {
                         let response = try await self.injectEvent("[CALLER SPEECH] \"\(text)\"")
                         onResponse(response)
                     } catch {
-                        self.logger.error("Failed to process caller speech: \(error)")
+                        self.logger.error("Failed to process caller speech (continuing): \(error)")
                     }
                     continue
                 default:
@@ -109,7 +145,7 @@ public final class ClaudeAgent: @unchecked Sendable {
                         let response = try await self.injectEvent(desc)
                         onResponse(response)
                     } catch {
-                        self.logger.error("Failed to inject event: \(error)")
+                        self.logger.error("Failed to inject event '\(desc)' (continuing): \(error)")
                     }
                 }
             }
@@ -119,112 +155,130 @@ public final class ClaudeAgent: @unchecked Sendable {
     // MARK: - Private
 
     private func runAgentLoop() async throws -> String {
+        truncateHistoryIfNeeded()
+
         var iterations = 0
         let maxIterations = 10
 
         while iterations < maxIterations {
             iterations += 1
 
-            let parameters = MessageParameter(
-                model: model,
-                messages: conversationHistory,
-                maxTokens: 1024,
-                system: .text(systemPrompt),
-                tools: PhoneTools.allTools
+            let response = try await callLLMWithRetry()
+
+            conversationHistory.append(
+                LLMMessage(role: .assistant, content: response.content)
             )
 
-            do {
-                let response = try await service.createMessage(parameters)
-                
-                // Convert response content to message content objects for history
-                let contentObjects = response.content.map { responseContentToMessageContent($0) }
-                conversationHistory.append(
-                    .init(role: .assistant, content: .list(contentObjects))
-                )
+            if response.stopReason == .toolUse {
+                var toolResults: [LLMContent] = []
 
-                // Check if we need to handle tool calls
-                if response.stopReason == "tool_use" {
-                    var toolResults: [MessageParameter.Message.Content.ContentObject] = []
-
-                    for content in response.content {
-                        if case .toolUse(let toolUse) = content {
-                            logger.info("Tool call: \(toolUse.name)")
-
-                            // Convert DynamicContent input to [String: Any]
-                            let inputDict = dynamicContentToDict(toolUse.input)
-                            let result = toolExecutor.execute(toolName: toolUse.name, input: inputDict)
-
-                            toolResults.append(
-                                .toolResult(toolUse.id, result)
-                            )
-                        }
+                for content in response.content {
+                    if case .toolUse(let id, let name, let input) = content {
+                        logger.info("Tool call: \(name)")
+                        let result = toolExecutor.execute(toolName: name, input: input)
+                        toolResults.append(.toolResult(id: id, content: result))
                     }
-
-                    // Add tool results as user message
-                    conversationHistory.append(
-                        .init(role: .user, content: .list(toolResults))
-                    )
-
-                    // Continue the loop to get the model's response to tool results
-                    continue
                 }
 
-                // No more tool calls — extract text response
-                return extractTextResponse(from: response.content)
-            } catch {
-                self.logger.error("\(error)")
-                throw error
+                conversationHistory.append(
+                    LLMMessage(role: .user, content: toolResults)
+                )
+                continue
             }
+
+            return extractTextResponse(from: response.content)
         }
 
         return "Agent reached maximum iterations without completing."
     }
 
-    /// Convert a response Content to a message ContentObject for conversation history
-    private func responseContentToMessageContent(
-        _ content: MessageResponse.Content
-    ) -> MessageParameter.Message.Content.ContentObject {
-        switch content {
-        case .text(let text, _):
-            return .text(text)
-        case .toolUse(let toolUse):
-            return .toolUse(toolUse.id, toolUse.name, toolUse.input)
-        case .thinking(let thinking):
-            return .thinking(thinking.thinking, thinking.signature ?? "")
-        default:
-            return .text("")
-        }
-    }
+    // MARK: - Retry Logic
 
-    private func extractTextResponse(from content: [MessageResponse.Content]) -> String {
-        var texts: [String] = []
-        for item in content {
-            if case .text(let text, _) = item {
-                texts.append(text)
+    private func callLLMWithRetry() async throws -> LLMResponse {
+        let maxRetries = 3
+        let baseDelay: UInt64 = 1_000_000_000
+
+        for attempt in 0..<maxRetries {
+            do {
+                return try await llmService.createMessage(
+                    systemPrompt: systemPrompt,
+                    messages: conversationHistory,
+                    tools: PhoneTools.allTools,
+                    maxTokens: 1024
+                )
+            } catch let error as LLMServiceError where error.isRetryable {
+                if attempt < maxRetries - 1 {
+                    let delay = baseDelay * UInt64(1 << attempt)
+                    logger.warning("LLM call failed (attempt \(attempt + 1)/\(maxRetries)), retrying in \(1 << attempt)s: \(error.localizedDescription)")
+                    try await Task.sleep(nanoseconds: delay)
+                } else {
+                    logger.error("LLM call failed after \(maxRetries) attempts: \(error.localizedDescription)")
+                    throw error
+                }
             }
         }
+        fatalError("Unreachable")
+    }
+
+    // MARK: - History Management
+
+    private let maxEstimatedTokens = 80_000
+    private let keepRecentMessages = 10
+
+    private func truncateHistoryIfNeeded() {
+        let estimatedTokens = conversationHistory.reduce(0) { total, message in
+            total + message.content.reduce(0) { subtotal, content in
+                switch content {
+                case .text(let t): return subtotal + t.count / 4
+                case .toolUse(_, _, let input):
+                    let desc = "\(input)"
+                    return subtotal + desc.count / 4
+                case .toolResult(_, let c): return subtotal + c.count / 4
+                }
+            }
+        }
+
+        guard estimatedTokens > maxEstimatedTokens else { return }
+        guard conversationHistory.count > keepRecentMessages else { return }
+
+        // Find a safe truncation boundary — never split tool_use/tool_result pairs.
+        // Walk backward from the target keep count to find a user message that
+        // contains only text (not tool results), which is a safe boundary.
+        let targetStart = conversationHistory.count - keepRecentMessages
+        var safeStart = targetStart
+        for i in stride(from: targetStart, through: 0, by: -1) {
+            let msg = conversationHistory[i]
+            if msg.role == .user {
+                let hasToolResult = msg.content.contains { content in
+                    if case .toolResult = content { return true }
+                    return false
+                }
+                if !hasToolResult {
+                    safeStart = i
+                    break
+                }
+            }
+        }
+
+        let trimCount = safeStart
+        guard trimCount > 0 else { return }
+
+        logger.warning("Truncating conversation: removing \(trimCount) older messages (est. \(estimatedTokens) tokens)")
+        conversationHistory = Array(conversationHistory.suffix(from: safeStart))
+
+        if let first = conversationHistory.first, first.role == .assistant {
+            conversationHistory.insert(
+                LLMMessage(role: .user, content: [.text("[conversation history truncated]")]),
+                at: 0
+            )
+        }
+    }
+
+    private func extractTextResponse(from content: [LLMContent]) -> String {
+        var texts: [String] = []
+        for item in content {
+            if case .text(let text) = item { texts.append(text) }
+        }
         return texts.joined(separator: "\n")
-    }
-
-    private func dynamicContentToDict(
-        _ input: [String: MessageResponse.Content.DynamicContent]
-    ) -> [String: Any] {
-        var result: [String: Any] = [:]
-        for (key, value) in input {
-            result[key] = dynamicContentToAny(value)
-        }
-        return result
-    }
-
-    private func dynamicContentToAny(_ value: MessageResponse.Content.DynamicContent) -> Any {
-        switch value {
-        case .string(let s): return s
-        case .integer(let i): return i
-        case .double(let d): return d
-        case .bool(let b): return b
-        case .null: return NSNull()
-        case .array(let arr): return arr.map { dynamicContentToAny($0) }
-        case .dictionary(let dict): return dynamicContentToDict(dict)
-        }
     }
 }

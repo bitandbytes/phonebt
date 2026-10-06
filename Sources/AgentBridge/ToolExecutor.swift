@@ -22,9 +22,9 @@ public final class ToolExecutor: @unchecked Sendable {
     private let device: HFPDevice
     private let audioRouter: AudioRouter
     private let logger = PhoneBTLogger(category: .agent)
-    public var ttsPlayer: TTSPlayer?
+    public var ttsPlayer: (any TTSProvider)?
 
-    public init(device: HFPDevice, audioRouter: AudioRouter, ttsPlayer: TTSPlayer? = nil) {
+    public init(device: HFPDevice, audioRouter: AudioRouter, ttsPlayer: (any TTSProvider)? = nil) {
         self.device = device
         self.audioRouter = audioRouter
         self.ttsPlayer = ttsPlayer

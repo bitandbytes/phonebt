@@ -36,20 +36,23 @@ func printBanner() {
 func printHelp() {
     print("""
     Commands:
-      scan          - Scan for Bluetooth devices
-      paired        - List paired devices
-      connect <idx> - Connect to device by index
-      disconnect    - Disconnect current device
-      dial <number> - Dial a phone number
-      answer        - Answer incoming call
-      hangup        - End current call
-      dtmf <digit>  - Send DTMF tone
-      status        - Show call status
-      phone         - Show phone status
-      audio         - Show audio devices
-      agent         - Enter AI agent mode
-      help          - Show this help
-      quit          - Exit PhoneBT
+      scan              - Scan for Bluetooth devices
+      paired            - List paired devices
+      connect <idx>     - Connect to device by index
+      disconnect        - Disconnect current device
+      dial <number>     - Dial a phone number
+      answer            - Answer incoming call
+      hangup            - End current call
+      dtmf <digit>      - Send DTMF tone
+      status            - Show call status
+      phone             - Show phone status
+      devices           - List audio devices
+      setdevice <idx>   - Select audio device for calls
+      set <key> <val>   - Configure settings (tts.voice, tts.model)
+      model <name>      - Set LLM model (e.g. claude-sonnet-4-6, gpt-4o)
+      agent             - Enter AI agent mode
+      help              - Show this help
+      quit              - Exit PhoneBT
     """)
 }
 
@@ -57,7 +60,6 @@ func printHelp() {
 
 /// CoreAudio device carrying phone-call audio. Defaults to the USB audio adapter
 /// wired to the phone; override with PHONEBT_AUDIO_DEVICE (name substring match).
-/// Falls back to a Bluetooth SCO device if the named device is not present.
 let callAudioDeviceName = ProcessInfo.processInfo.environment["PHONEBT_AUDIO_DEVICE"] ?? "USB Advanced Audio Device"
 
 let bluetoothManager = BluetoothManager()
@@ -74,6 +76,30 @@ var audioCapture: AudioCapture?
 var ttsPlayer: TTSPlayer?
 var scoConnectTask: Task<Void, Never>?
 var activeAudioDevice: AudioDeviceInfo?
+
+// TTS configuration
+var ttsVoiceID = "21m00Tcm4TlvDq8ikWAM"
+var ttsModelID = "eleven_turbo_v2"
+
+// LLM configuration
+var currentModelName = ProcessInfo.processInfo.environment["PHONEBT_MODEL"] ?? "claude-sonnet-4-6"
+var currentLLMService: (any LLMService)?
+
+func makeLLMService(modelName: String) -> (any LLMService)? {
+    if modelName.hasPrefix("gpt-") || modelName.hasPrefix("o1") || modelName.hasPrefix("o3") || modelName.hasPrefix("o4") {
+        guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
+            print("OPENAI_API_KEY environment variable not set.")
+            return nil
+        }
+        return OpenAILLMService(apiKey: apiKey, model: modelName)
+    } else {
+        guard let apiKey = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] else {
+            print("ANTHROPIC_API_KEY environment variable not set.")
+            return nil
+        }
+        return AnthropicLLMService(apiKey: apiKey, model: modelName)
+    }
+}
 
 // MARK: - Signal Handling
 
@@ -210,8 +236,8 @@ func startAudioPipeline() -> Bool {
 
     // Set up TTS player if ElevenLabs key is available
     if let elevenLabsKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] {
-        ttsPlayer = TTSPlayer(sessionManager: session, apiKey: elevenLabsKey)
-        logger.info("TTS player initialized with ElevenLabs")
+        ttsPlayer = TTSPlayer(sessionManager: session, apiKey: elevenLabsKey, voiceID: ttsVoiceID, modelID: ttsModelID)
+        logger.info("TTS player initialized with ElevenLabs (voice: \(ttsVoiceID), model: \(ttsModelID))")
     } else {
         logger.info("ELEVENLABS_API_KEY not set — TTS disabled")
     }
@@ -323,15 +349,24 @@ func handleEvent(_ event: HFPEvent) {
     }
 }
 
-func handleDial(number: String) {
-    guard let device = hfpDevice else {
-        print("Not connected. Use 'connect' first.")
-        return
+func preCallCheck() -> Bool {
+    guard let device = hfpDevice, device.currentState.connection == .connected else {
+        print("Phone not connected via Bluetooth. Use 'connect' first.")
+        return false
     }
+    guard audioRouter.callAudioDevice() != nil else {
+        print("No audio device selected or available. Use 'devices' and 'setdevice' to pick one.")
+        return false
+    }
+    return true
+}
+
+func handleDial(number: String) {
+    guard preCallCheck() else { return }
     do {
-        try device.dial(number: number)
+        try hfpDevice!.dial(number: number)
         print("Dialing \(number)...")
-        try? device.transferAudioToComputer()
+        try? hfpDevice!.transferAudioToComputer()
     } catch {
         print("Dial failed: \(error.localizedDescription)")
     }
@@ -345,7 +380,7 @@ func handleAnswer() {
     do {
         try device.acceptCall()
         try? device.transferAudioToComputer()
-        _ = audioRouter.routeToBluetoothDevice()
+        _ = audioRouter.routeToCallAudioDevice()
         print("Call answered")
     } catch {
         print("Answer failed: \(error.localizedDescription)")
@@ -410,36 +445,97 @@ func handlePhoneStatus() {
 }
 
 func handleAudioDevices() {
-    let devices = audioRouter.listAudioDevices()
+    let devices = audioRouter.allDevices()
     let selected = audioRouter.callAudioDevice()
     if devices.isEmpty {
         print("No audio devices found.")
-    } else {
-        print("Audio devices (call audio device marked with *):")
-        for device in devices {
-            let marker = device.id == selected?.id ? "* " : "  "
-            print("\(marker)\(device.name) [id=\(device.id), transport=\(device.transportTypeDescription), in=\(device.hasInput), out=\(device.hasOutput)]")
-        }
+        return
+    }
+    print("Audio devices (selected marked with *):")
+    for (i, device) in devices.enumerated() {
+        let marker = device.id == selected?.id ? "*" : " "
+        let io = device.hasInput && device.hasOutput ? "in/out" :
+                 device.hasInput ? "in" :
+                 device.hasOutput ? "out" : "-"
+        print("  [\(i)] \(marker) \(device.name) [\(device.transportTypeDescription), \(io)]")
     }
     if selected == nil {
-        print("⚠️  Call audio device \"\(callAudioDeviceName)\" not found (set PHONEBT_AUDIO_DEVICE to override).")
+        print("\nNo call audio device selected. Use 'setdevice <idx>' to select one.")
     }
 }
 
-func handleAgentMode() async {
-    guard let device = hfpDevice else {
-        print("Not connected. Connect to a phone first.")
+func handleSetDevice(indexStr: String) {
+    let devices = audioRouter.allDevices()
+    guard let index = Int(indexStr), index >= 0, index < devices.count else {
+        print("Invalid index. Run 'devices' to see available devices.")
         return
     }
+    let device = devices[index]
+    guard device.hasInput && device.hasOutput else {
+        print("Device '\(device.name)' does not support both input and output. Pick a full-duplex device.")
+        return
+    }
+    audioRouter.setPreferredDeviceName(device.name)
+    print("Audio device set to: \(device.name)")
+}
 
-    guard let apiKey = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] else {
-        print("ANTHROPIC_API_KEY environment variable not set.")
-        print("Export it with: export ANTHROPIC_API_KEY=your-key-here")
+func handleSet(argument: String) {
+    let parts = argument.split(separator: " ", maxSplits: 1).map(String.init)
+    guard parts.count == 2 else {
+        print("Usage: set <key> <value>")
+        print("Keys: tts.voice, tts.model")
+        return
+    }
+    let key = parts[0].lowercased()
+    let value = parts[1]
+
+    switch key {
+    case "tts.voice":
+        ttsVoiceID = value
+        if let player = ttsPlayer as? TTSPlayer {
+            player.setVoiceID(value)
+        }
+        print("TTS voice ID set to: \(value)")
+    case "tts.model":
+        ttsModelID = value
+        if let player = ttsPlayer as? TTSPlayer {
+            player.setModelID(value)
+        }
+        print("TTS model set to: \(value)")
+    default:
+        print("Unknown key: \(key). Available: tts.voice, tts.model")
+    }
+}
+
+func handleModel(argument: String) {
+    guard !argument.isEmpty else {
+        print("Current model: \(currentModelName)")
+        print("Usage: model <name>")
+        print("Examples: model claude-sonnet-4-6, model gpt-4o, model claude-haiku-4-5-20251001")
+        return
+    }
+    guard let service = makeLLMService(modelName: argument) else { return }
+    currentLLMService = service
+    currentModelName = argument
+    print("Model set to: \(argument)")
+}
+
+func handleAgentMode() async {
+    guard preCallCheck() else { return }
+    let device = hfpDevice!
+
+    let llmService: any LLMService
+    if let existing = currentLLMService {
+        llmService = existing
+    } else if let created = makeLLMService(modelName: currentModelName) {
+        currentLLMService = created
+        llmService = created
+    } else {
         return
     }
 
     let executor = ToolExecutor(device: device, audioRouter: audioRouter, ttsPlayer: ttsPlayer)
-    let agent = ClaudeAgent(apiKey: apiKey, toolExecutor: executor, eventStream: device.eventStream)
+    let agent = ClaudeAgent(llmService: llmService, toolExecutor: executor, eventStream: device.eventStream)
     claudeAgent = agent
 
     // Start event listener
@@ -449,7 +545,7 @@ func handleAgentMode() async {
         fflush(stdout)
     }
 
-    print("\nAI Agent Mode — type natural language commands")
+    print("\nAI Agent Mode (model: \(currentModelName)) — type natural language commands")
     print("Type 'exit' to return to manual mode\n")
 
     while isRunning {
@@ -533,8 +629,14 @@ let mainTask = Task {
             handleStatus()
         case "phone":
             handlePhoneStatus()
-        case "audio":
+        case "devices", "audio":
             handleAudioDevices()
+        case "setdevice":
+            handleSetDevice(indexStr: argument)
+        case "set":
+            handleSet(argument: argument)
+        case "model":
+            handleModel(argument: argument)
         case "agent", "ai":
             await handleAgentMode()
         case "help":

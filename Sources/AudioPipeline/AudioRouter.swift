@@ -16,12 +16,12 @@ import Foundation
 import CoreAudio
 import Shared
 
-/// Routes system audio to the device carrying phone-call audio
-/// (a USB audio adapter by default, or a Bluetooth SCO device as fallback).
+/// Routes system audio to the user-selected call audio device.
 public final class AudioRouter: @unchecked Sendable {
     private let deviceManager: AudioDeviceManager
-    private let preferredDeviceName: String?
+    private var preferredDeviceName: String?
     private let logger = PhoneBTLogger(category: .audio)
+    private let lock = NSLock()
 
     private var previousOutputDevice: AudioDeviceID?
     private var previousInputDevice: AudioDeviceID?
@@ -32,15 +32,33 @@ public final class AudioRouter: @unchecked Sendable {
         self.preferredDeviceName = preferredDeviceName
     }
 
+    /// Update the preferred device name for call audio routing.
+    public func setPreferredDeviceName(_ name: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        preferredDeviceName = name
+    }
+
     /// The device phone-call audio is resolved to, if currently present.
     public func callAudioDevice() -> AudioDeviceInfo? {
-        return deviceManager.findCallAudioDevice(preferredName: preferredDeviceName)
+        lock.lock()
+        let name = preferredDeviceName
+        lock.unlock()
+        return deviceManager.findCallAudioDevice(preferredName: name)
+    }
+
+    /// All audio devices currently visible to CoreAudio.
+    public func allDevices() -> [AudioDeviceInfo] {
+        return deviceManager.getAllDevices()
     }
 
     /// Route system default input/output to the call audio device.
     public func routeToCallAudioDevice() -> Bool {
         guard let device = callAudioDevice() else {
-            logger.error("No call audio device found for routing (preferred: \(preferredDeviceName ?? "none"))")
+            lock.lock()
+            let name = preferredDeviceName
+            lock.unlock()
+            logger.error("No call audio device found for routing (preferred: \(name ?? "none"))")
             return false
         }
 
@@ -61,12 +79,6 @@ public final class AudioRouter: @unchecked Sendable {
             logger.error("Failed to route audio to \(device.name)")
         }
         return isRouted
-    }
-
-    /// Route audio to the call audio device when SCO connection opens.
-    /// Kept for compatibility; prefer `routeToCallAudioDevice()`.
-    public func routeToBluetoothDevice() -> Bool {
-        return routeToCallAudioDevice()
     }
 
     /// Restore previous audio routing when call ends

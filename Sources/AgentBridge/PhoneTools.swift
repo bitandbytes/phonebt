@@ -13,12 +13,11 @@
 // limitations under the License.
 
 import Foundation
-import SwiftAnthropic
 
-/// Tool definitions for the Claude agent to control phone calls
+/// Tool definitions for the AI agent to control phone calls
 public enum PhoneTools {
 
-    public static let allTools: [MessageParameter.Tool] = [
+    public static let allTools: [LLMToolDefinition] = [
         dialNumberTool,
         acceptCallTool,
         endCallTool,
@@ -28,14 +27,13 @@ public enum PhoneTools {
         sayToCallerTool,
     ]
 
-    public static let dialNumberTool: MessageParameter.Tool = .function(
+    public static let dialNumberTool = LLMToolDefinition(
         name: "dial_number",
         description: "Dial a phone number to make an outgoing call. The number should be in a valid format (digits, optional + prefix, optional dashes/spaces).",
-        inputSchema: JSONSchema(
-            type: .object,
+        parameters: LLMToolParameters(
             properties: [
-                "number": JSONSchema.Property(
-                    type: .string,
+                "number": LLMToolProperty(
+                    type: "string",
                     description: "The phone number to dial, e.g. '+15551234567' or '555-123-4567'"
                 ),
             ],
@@ -43,32 +41,25 @@ public enum PhoneTools {
         )
     )
 
-    public static let acceptCallTool: MessageParameter.Tool = .function(
+    public static let acceptCallTool = LLMToolDefinition(
         name: "accept_call",
         description: "Accept/answer an incoming phone call.",
-        inputSchema: JSONSchema(
-            type: .object,
-            properties: [:]
-        )
+        parameters: LLMToolParameters(properties: [:])
     )
 
-    public static let endCallTool: MessageParameter.Tool = .function(
+    public static let endCallTool = LLMToolDefinition(
         name: "end_call",
         description: "End/hang up the current active call.",
-        inputSchema: JSONSchema(
-            type: .object,
-            properties: [:]
-        )
+        parameters: LLMToolParameters(properties: [:])
     )
 
-    public static let sendDTMFTool: MessageParameter.Tool = .function(
+    public static let sendDTMFTool = LLMToolDefinition(
         name: "send_dtmf",
         description: "Send a DTMF tone (touch-tone digit) during an active call. Used for navigating phone menus (IVR systems).",
-        inputSchema: JSONSchema(
-            type: .object,
+        parameters: LLMToolParameters(
             properties: [
-                "digit": JSONSchema.Property(
-                    type: .string,
+                "digit": LLMToolProperty(
+                    type: "string",
                     description: "A single DTMF digit: 0-9, *, or #"
                 ),
             ],
@@ -76,32 +67,25 @@ public enum PhoneTools {
         )
     )
 
-    public static let getCallStatusTool: MessageParameter.Tool = .function(
+    public static let getCallStatusTool = LLMToolDefinition(
         name: "get_call_status",
         description: "Get the current call status including call state, direction, duration, and phone number.",
-        inputSchema: JSONSchema(
-            type: .object,
-            properties: [:]
-        )
+        parameters: LLMToolParameters(properties: [:])
     )
 
-    public static let getPhoneStatusTool: MessageParameter.Tool = .function(
+    public static let getPhoneStatusTool = LLMToolDefinition(
         name: "get_phone_status",
         description: "Get the phone's status including signal strength, battery level, service availability, operator name, and roaming status.",
-        inputSchema: JSONSchema(
-            type: .object,
-            properties: [:]
-        )
+        parameters: LLMToolParameters(properties: [:])
     )
 
-    public static let sayToCallerTool: MessageParameter.Tool = .function(
+    public static let sayToCallerTool = LLMToolDefinition(
         name: "say_to_caller",
         description: "Speak text to the caller during an active phone call using text-to-speech. The caller will hear your spoken words through the phone.",
-        inputSchema: JSONSchema(
-            type: .object,
+        parameters: LLMToolParameters(
             properties: [
-                "text": JSONSchema.Property(
-                    type: .string,
+                "text": LLMToolProperty(
+                    type: "string",
                     description: "The text to speak to the caller"
                 ),
             ],
