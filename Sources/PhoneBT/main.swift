@@ -236,7 +236,7 @@ func handleCall(argument: String) {
         try? device.transferAudioToComputer()
         print("Dialing \(call.number)… GPT-Live session is preparing.")
     } catch {
-        session.close()
+        session.close(finalizeOutcome: false)
         callSession = nil
         print("Dial failed: \(error.localizedDescription)")
     }

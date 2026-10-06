@@ -47,7 +47,9 @@ import Testing
     let responses = try #require(delegation["responses"] as? [String: Any])
     #expect(responses["model"] as? String == "gpt-6.1-sol")
     #expect(responses["parallel_tool_calls"] as? Bool == false)
-    #expect((responses["tools"] as? [[String: Any]])?.count == 2)
+    let tools = try #require(responses["tools"] as? [[String: Any]])
+    #expect(tools.count == 3)
+    #expect(tools.contains { $0["name"] as? String == "record_appointment_outcome" })
 }
 
 @Test func liveAudioAppendEncodesPCMBytes() {
@@ -98,10 +100,31 @@ import Testing
     #expect(LiveProtocol.responseCreate()["type"] as? String == "response.create")
 }
 
+@Test func backendFinalizationMessageUsesResponsesInput() throws {
+    let event = LiveProtocol.backendMessage("Finalize the call result")
+
+    #expect(event["type"] as? String == "response.item.create")
+    let item = try #require(event["item"] as? [String: Any])
+    #expect(item["type"] as? String == "message")
+    #expect(item["role"] as? String == "user")
+    let content = try #require(item["content"] as? [[String: Any]])
+    #expect(content.first?["text"] as? String == "Finalize the call result")
+}
+
 @Test func dtmfValidationAcceptsOnlyOneTelephoneKey() {
     #expect(LiveProtocol.isValidDTMFTone("5"))
     #expect(LiveProtocol.isValidDTMFTone("#"))
     #expect(!LiveProtocol.isValidDTMFTone("12"))
     #expect(!LiveProtocol.isValidDTMFTone("A"))
     #expect(!LiveProtocol.isValidDTMFTone(""))
+}
+
+@Test func audioDumpPathsAreCreatedBesideTheResultFile() {
+    let resultURL = URL(
+        fileURLWithPath: "/calls/appointment-2026-10-06T21-08-42+02-00-appointment-result.json"
+    )
+    let paths = AudioDumpPathResolver.paths(beside: resultURL)
+
+    #expect(paths.inputURL.path == "/calls/appointment-2026-10-06T21-08-42+02-00-agent-input.pcm")
+    #expect(paths.outputURL.path == "/calls/appointment-2026-10-06T21-08-42+02-00-agent-output.pcm")
 }

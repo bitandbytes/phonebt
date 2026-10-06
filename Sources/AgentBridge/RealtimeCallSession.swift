@@ -23,6 +23,26 @@ struct LiveFunctionCall {
     let arguments: [String: Any]
 }
 
+struct AudioDumpPaths {
+    let inputURL: URL
+    let outputURL: URL
+}
+
+enum AudioDumpPathResolver {
+    static func paths(beside resultURL: URL) -> AudioDumpPaths {
+        let directory = resultURL.deletingLastPathComponent()
+        let resultStem = resultURL.deletingPathExtension().lastPathComponent
+        let resultSuffix = "-appointment-result"
+        let callStem = resultStem.hasSuffix(resultSuffix)
+            ? String(resultStem.dropLast(resultSuffix.count))
+            : resultStem
+        return AudioDumpPaths(
+            inputURL: directory.appendingPathComponent("\(callStem)-agent-input.pcm"),
+            outputURL: directory.appendingPathComponent("\(callStem)-agent-output.pcm")
+        )
+    }
+}
+
 enum LiveProtocol {
     static func sessionStart(
         voice: String,
@@ -105,6 +125,21 @@ enum LiveProtocol {
         ]
     }
 
+    static func backendMessage(_ text: String) -> [String: Any] {
+        [
+            "type": "response.item.create",
+            "event_id": "phonebt_backend_message_\(UUID().uuidString)",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [[
+                    "type": "input_text",
+                    "text": text,
+                ]],
+            ],
+        ]
+    }
+
     static func isValidDTMFTone(_ tone: String) -> Bool {
         tone.count == 1 && tone.first.map { "0123456789*#".contains($0) } == true
     }
@@ -112,7 +147,15 @@ enum LiveProtocol {
     private static let toolDefinitions: [[String: Any]] = [[
         "type": "function",
         "name": "end_call",
-        "description": "Record the outcome and end the call after the spoken goodbye has completed.",
+        "description": "End the telephone call after the spoken goodbye and after record_appointment_outcome has saved the latest outcome.",
+        "parameters": [
+            "type": "object",
+            "properties": [:],
+        ],
+    ], [
+        "type": "function",
+        "name": "record_appointment_outcome",
+        "description": "Checkpoint the latest appointment outcome without ending the telephone call. Call whenever confirmed outcome details become available and again if they change.",
         "parameters": [
             "type": "object",
             "properties": [
@@ -159,6 +202,7 @@ public final class CallSession: @unchecked Sendable {
     private var receiveTask: Task<Void, Never>?
     private var audioBridge: RealtimeAudioBridge?
     private var isReady = false
+    private var isClosing = false
     private var isClosed = false
     private var hasReceivedOutputAudio = false
     private var pendingAudio: [Data] = []
@@ -177,7 +221,7 @@ public final class CallSession: @unchecked Sendable {
         self.resultURL = resultURL
         self.device = device
         self.onDiagnostic = onDiagnostic
-        self.audioDumper = RealtimeAudioDumper.fromEnvironment(logger: logger)
+        self.audioDumper = RealtimeAudioDumper.besideResultFile(resultURL, logger: logger)
     }
 
     /// Connects and configures the model while the outgoing call is dialing.
@@ -209,18 +253,43 @@ public final class CallSession: @unchecked Sendable {
         report("Audio capture connected to Live session")
     }
 
-    public func close() {
-        let shouldClose: Bool = stateQueue.sync {
-            guard !isClosed else { return false }
-            isClosed = true
-            report("Closing GPT-Live session")
+    public func close(finalizeOutcome: Bool = true) {
+        let shouldRequestFinalOutcome: Bool? = stateQueue.sync {
+            guard !isClosing, !isClosed else { return nil }
+            isClosing = true
             audioBridge?.shutdown()
             audioBridge = nil
             pendingAudio.removeAll()
+            return finalizeOutcome && pendingResult == nil && isReady && webSocket != nil
+        }
+        guard let shouldRequestFinalOutcome else { return }
+
+        if shouldRequestFinalOutcome {
+            report("Call ended before an outcome was recorded; requesting final appointment result")
+            send(LiveProtocol.backendMessage(
+                "The telephone call has ended. Review the complete conversation and call " +
+                "record_appointment_outcome exactly once with the best supported final outcome. " +
+                "Use unknown only if the conversation truly did not establish the outcome. " +
+                "Do not call end_call because the telephone call is already over."
+            ))
+            send(LiveProtocol.responseCreate())
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [self] in
+                completeClose()
+            }
+        } else {
+            completeClose()
+        }
+    }
+
+    private func completeClose() {
+        let shouldClose: Bool = stateQueue.sync {
+            guard !isClosed else { return false }
+            isClosed = true
             return true
         }
         guard shouldClose else { return }
 
+        report("Closing GPT-Live session")
         send([
             "type": "session.close",
             "event_id": "phonebt_session_close",
@@ -313,8 +382,29 @@ public final class CallSession: @unchecked Sendable {
             return
         }
 
+        if call.name == "record_appointment_outcome" {
+            if let error = recordResult(arguments: call.arguments) {
+                let result = "{\"success\":false,\"error\":\"\(escapeJSON(error))\"}"
+                sendFunctionResult(callID: call.callID, result: result)
+                return
+            }
+
+            report("Checkpointed the latest appointment outcome")
+            sendFunctionResult(callID: call.callID, result: "{\"success\":true}")
+            if stateQueue.sync(execute: { isClosing }) {
+                completeClose()
+            }
+            return
+        }
+
         guard call.name == "end_call" else { return }
-        recordResult(arguments: call.arguments)
+        guard stateQueue.sync(execute: { pendingResult != nil }) else {
+            sendFunctionResult(
+                callID: call.callID,
+                result: "{\"success\":false,\"error\":\"Record the appointment outcome before ending the call\"}"
+            )
+            return
+        }
         let bridge = stateQueue.sync { audioBridge }
         if let bridge {
             report("Waiting for final audio playback before ending the call")
@@ -377,17 +467,27 @@ public final class CallSession: @unchecked Sendable {
         send(LiveProtocol.responseCreate())
     }
 
-    private func recordResult(arguments: [String: Any]) {
+    private func recordResult(arguments: [String: Any]) -> String? {
         let status = arguments["status"] as? String ?? "unknown"
-        let requestedDate = nonempty(arguments["appointment_date"] as? String)
+        guard ["booked", "not_booked", "unknown"].contains(status) else {
+            return "Invalid appointment status"
+        }
+
+        let appointmentDate = nonempty(arguments["appointment_date"] as? String)
+        let appointmentTime = nonempty(arguments["appointment_time"] as? String)
+        if status == "booked", appointmentDate == nil || appointmentTime == nil {
+            return "A booked appointment requires a confirmed date and time"
+        }
+
         let result = AppointmentResult(
             status: status,
-            appointmentDate: requestedDate,
-            appointmentTime: nonempty(arguments["appointment_time"] as? String),
+            appointmentDate: appointmentDate,
+            appointmentTime: appointmentTime,
             practice: nonempty(arguments["practice"] as? String),
             notes: nonempty(arguments["notes"] as? String)
         )
         stateQueue.sync { pendingResult = result }
+        return nil
     }
 
     private func writeFallbackResultIfNeeded() {
@@ -426,7 +526,7 @@ public final class CallSession: @unchecked Sendable {
 
     private func sendAudio(_ data: Data) {
         stateQueue.async { [weak self] in
-            guard let self, !self.isClosed else { return }
+            guard let self, !self.isClosing, !self.isClosed else { return }
             if self.isReady {
                 self.sendAudioImmediately(data)
             } else {
@@ -477,10 +577,12 @@ public final class CallSession: @unchecked Sendable {
         Delegation policy:
         Backend tools:
         - Send one telephone keypad tone for an automated IVR menu.
-        - Record the final appointment outcome and end the telephone call.
+        - Checkpoint confirmed appointment information without ending the call.
+        - End the telephone call after the latest outcome has been checkpointed.
 
         Delegate to the backend when:
         - An automated menu explicitly requests a keypad selection.
+        - The callee confirms an appointment date and time or confirms that no appointment can be made. Delegate immediately so the outcome is checkpointed even if the callee hangs up next.
         - The appointment objective is complete or cannot be completed and you have finished saying your final goodbye.
         - Careful reasoning about the appointment workflow or final structured outcome is needed.
 
@@ -488,7 +590,7 @@ public final class CallSession: @unchecked Sendable {
         - You can continue the ordinary conversation from information already provided.
         - You need a brief clarification from the callee.
 
-        Delegate before relying on backend work. Do not guess a tool result. For keypad requests, delegate silently and remain silent after the tone while listening for the next prompt. When the objective is complete or cannot be completed, say one final goodbye, finish speaking, and immediately delegate the final outcome and call closure. Do not wait for another response after your final goodbye, even if the other person has not said goodbye or remains silent.
+        Delegate before relying on backend work. Do not guess a tool result. For keypad requests, delegate silently and remain silent after the tone while listening for the next prompt. After checkpointing an outcome, continue the conversation normally. When the objective is complete or cannot be completed, say one final goodbye, finish speaking, and immediately delegate call closure. Do not wait for another response after your final goodbye, even if the other person has not said goodbye or remains silent.
         """
     }
 
@@ -510,9 +612,9 @@ public final class CallSession: @unchecked Sendable {
 
         If an appointment is offered, make sure the voice conversation confirms the date and time naturally. Preserve the confirmed date, time, practice, and useful details. Do not challenge the callee's stated calendar date unless they correct it.
         
-        For a booked appointment, populate appointment_date in MM-DD format and appointment_time when known. Repeat the confirmed date, time, practice, and other useful outcome details in notes. Use status not_booked when the appointment could not be made, and unknown only when the outcome genuinely cannot be determined.
+        Call record_appointment_outcome immediately whenever the conversation establishes a meaningful outcome. For a booked appointment, both a confirmed appointment_date in MM-DD format and a confirmed appointment_time are required. Repeat the confirmed date, time, practice, and other useful details in notes. Use status not_booked when the appointment could not be made, and unknown only when the outcome genuinely cannot be determined. Call record_appointment_outcome again if later conversation changes or adds material details.
         
-        Once the intent of making an appointment is made or not made, given no appointment are available, call end_call after saying a goodbye greeting. Let make sure the conversation ended naturally. 
+        Call end_call only after record_appointment_outcome has succeeded and the voice assistant has finished its goodbye. If the telephone call has already ended, record the best supported outcome but do not call end_call.
         """
     }
 
@@ -529,32 +631,27 @@ public final class CallSession: @unchecked Sendable {
     }
 }
 
-/// Writes the exact PCM16 byte streams crossing the GPT-Live API boundary when
-/// `PHONEBT_AUDIO_DUMP_DIR` is set. Writes are serialized off the audio path.
+/// Writes the exact PCM16 byte streams crossing the GPT-Live API boundary.
+/// Files are created beside the call configuration and result files.
 private final class RealtimeAudioDumper: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.phonebt.realtime.audio-dump")
     private let inputHandle: FileHandle
     private let outputHandle: FileHandle
     private var isClosed = false
 
-    static func fromEnvironment(logger: PhoneBTLogger) -> RealtimeAudioDumper? {
-        guard let path = ProcessInfo.processInfo.environment["PHONEBT_AUDIO_DUMP_DIR"],
-              !path.isEmpty else { return nil }
-
+    static func besideResultFile(_ resultURL: URL, logger: PhoneBTLogger) -> RealtimeAudioDumper? {
         do {
-            let expandedPath = NSString(string: path).expandingTildeInPath
-            let directory = URL(fileURLWithPath: expandedPath, isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let paths = AudioDumpPathResolver.paths(beside: resultURL)
+            try Data().write(to: paths.inputURL, options: .atomic)
+            try Data().write(to: paths.outputURL, options: .atomic)
 
-            let timestamp = ISO8601DateFormatter().string(from: Date())
-                .replacingOccurrences(of: ":", with: "-")
-            let inputURL = directory.appendingPathComponent("\(timestamp)-agent-input.pcm")
-            let outputURL = directory.appendingPathComponent("\(timestamp)-agent-output.pcm")
-            FileManager.default.createFile(atPath: inputURL.path, contents: nil)
-            FileManager.default.createFile(atPath: outputURL.path, contents: nil)
-
-            let dumper = try RealtimeAudioDumper(inputURL: inputURL, outputURL: outputURL)
-            logger.info("GPT-Live audio dump enabled: \(inputURL.path), \(outputURL.path)")
+            let dumper = try RealtimeAudioDumper(
+                inputURL: paths.inputURL,
+                outputURL: paths.outputURL
+            )
+            logger.info(
+                "GPT-Live audio dump enabled: \(paths.inputURL.path), \(paths.outputURL.path)"
+            )
             return dumper
         } catch {
             logger.error("Could not enable GPT-Live audio dump: \(error.localizedDescription)")

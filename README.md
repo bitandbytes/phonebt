@@ -2,7 +2,7 @@
 
 PhoneBT is a macOS command-line HFP client that places a cellular call through a paired phone and connects the established call directly to OpenAI's `gpt-live-1` full-duplex voice model.
 
-The phone and `IOBluetoothHandsFreeDevice` callbacks are authoritative for connection, call, and SCO state. The model does not dial or answer calls. Once HFP reports an active outgoing call, PhoneBT streams call audio to GPT-Live and plays model audio back to the selected call device. GPT-Live handles the natural conversation and delegates appointment reasoning and tool selection to a low-latency Responses backend. The backend can invoke `send_dtmf` to navigate an automated phone menu and `end_call` after GPT-Live has concluded the conversation. DTMF is sent as an out-of-band Bluetooth HFP command to the phone; it is not mixed into the PCM audio stream.
+The phone and `IOBluetoothHandsFreeDevice` callbacks are authoritative for connection, call, and SCO state. The model does not dial or answer calls. Once HFP reports an active outgoing call, PhoneBT streams call audio to GPT-Live and plays model audio back to the selected call device. GPT-Live handles the natural conversation and delegates appointment reasoning and tool selection to a Responses backend. The backend can invoke `send_dtmf` to navigate an automated phone menu, `record_appointment_outcome` to checkpoint confirmed result data without ending the call, and `end_call` after GPT-Live has concluded the conversation. If the callee hangs up before a checkpoint arrives, PhoneBT briefly asks the backend to recover the structured outcome from conversation context before writing the fallback result. DTMF is sent as an out-of-band Bluetooth HFP command to the phone; it is not mixed into the PCM audio stream.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ The phone and `IOBluetoothHandsFreeDevice` callbacks are authoritative for conne
 
 The default audio-device name is `USB Advanced Audio Device`. Set `PHONEBT_AUDIO_DEVICE` to override the case-insensitive name match, or select a device interactively.
 
-For audio-path debugging, set `PHONEBT_AUDIO_DUMP_DIR` to a writable directory. Each call writes two raw mono, 24 kHz, signed 16-bit little-endian PCM files: `*-agent-input.pcm` contains the bytes sent to the Realtime API, and `*-agent-output.pcm` contains the bytes received from it. These files may contain sensitive call audio and are not created unless the variable is set.
+Audio dumping is always enabled. Each call writes two raw mono, 24 kHz, signed 16-bit little-endian PCM files beside the input JSON and appointment-result file: `*-agent-input.pcm` contains the bytes sent to GPT-Live, and `*-agent-output.pcm` contains the bytes received from it. Their names use the same full date-and-time stamp as the appointment-result file, so multiple calls made on the same day do not overwrite one another. These files contain sensitive call audio and should be handled accordingly.
 
 ## Run
 
@@ -68,15 +68,9 @@ A booked appointment result has this format:
 
 `appointmentDate` uses `MM-DD` without a year. `notes` retains a readable summary including the confirmed date, time, practice, and other useful call details, even when those values also appear in structured fields. `status` is `booked`, `not_booked`, or `unknown`. Optional appointment fields are omitted when unavailable. If the call ends without a structured outcome, PhoneBT writes an `unknown` result.
 
-Input and output audio to and from the AI model can be dumped by setting:
-
+The automatically created PCM files can be imported into Audacity or played using:
 ```bash
-export PHONEBT_AUDIO_DUMP_DIR=/tmp/phonebt-audio
-```
-
-PCM files could be imported to Audacity or could be played using
-```bash
-ffplay -f s16le -ar 24000 -ac 1 /tmp/phonebt-audio/<file>.pcm
+ffplay -f s16le -ar 24000 -ac 1 /path/to/config/<file>-agent-input.pcm
 ```
 
 GPT-Live connection and API events are printed in the terminal. `verbose on` additionally prints every HFP callback event. To inspect the complete macOS unified logs in another terminal, run:
