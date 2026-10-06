@@ -43,7 +43,7 @@ public struct CallConfiguration: Codable, Sendable {
         self.language = language
     }
 
-    var realtimeVoice: String {
+    var liveVoice: String {
         switch gender {
         case .male:
             return "cedar"

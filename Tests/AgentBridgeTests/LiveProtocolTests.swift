@@ -1,0 +1,107 @@
+// Copyright 2026 ICOA Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+@testable import AgentBridge
+import Foundation
+import Testing
+
+@Test func liveSessionStartContainsAudioAndDelegationConfiguration() throws {
+    let event = LiveProtocol.sessionStart(
+        voice: "cedar",
+        liveInstructions: "Live instructions",
+        backendInstructions: "Backend instructions",
+        callerContext: "Trusted caller facts"
+    )
+
+    #expect(event["type"] as? String == "session.start")
+    let session = try #require(event["session"] as? [String: Any])
+    #expect(session["model"] as? String == "gpt-live-1")
+
+    let input = try #require(session["input"] as? [[String: Any]])
+    let callerFacts = try #require(input.first)
+    #expect(callerFacts["role"] as? String == "developer")
+    let callerFactContent = try #require(callerFacts["content"] as? [[String: Any]])
+    #expect(callerFactContent.first?["type"] as? String == "input_text")
+    #expect(callerFactContent.first?["text"] as? String == "Trusted caller facts")
+
+    let audio = try #require(session["audio"] as? [String: Any])
+    let format = try #require(audio["format"] as? [String: Any])
+    #expect(format["type"] as? String == "audio/pcm")
+    #expect(format["rate"] as? Int == 24_000)
+    let output = try #require(audio["output"] as? [String: Any])
+    #expect(output["voice"] as? String == "cedar")
+
+    let delegation = try #require(session["delegation"] as? [String: Any])
+    #expect(delegation["type"] as? String == "responses")
+    let responses = try #require(delegation["responses"] as? [String: Any])
+    #expect(responses["model"] as? String == "gpt-6.1-sol")
+    #expect(responses["parallel_tool_calls"] as? Bool == false)
+    #expect((responses["tools"] as? [[String: Any]])?.count == 2)
+}
+
+@Test func liveAudioAppendEncodesPCMBytes() {
+    let event = LiveProtocol.audioAppend(Data([0x01, 0x02, 0x03, 0x04]))
+
+    #expect(event["type"] as? String == "session.input_audio.append")
+    #expect(event["audio"] as? String == "AQIDBA==")
+}
+
+@Test func delegatedFunctionCallIsParsedFromNestedResponseEvent() throws {
+    let envelope: [String: Any] = [
+        "type": "response.event",
+        "event": [
+            "type": "response.output_item.done",
+            "item": [
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "send_dtmf",
+                "arguments": #"{"tone":"7"}"#,
+            ],
+        ],
+    ]
+
+    let call = try #require(LiveProtocol.functionCall(from: envelope))
+    #expect(call.name == "send_dtmf")
+    #expect(call.callID == "call_123")
+    #expect(call.arguments["tone"] as? String == "7")
+}
+
+@Test func incompleteDelegatedFunctionCallIsIgnored() {
+    let envelope: [String: Any] = [
+        "event": [
+            "type": "response.output_item.added",
+            "item": ["type": "function_call"],
+        ],
+    ]
+
+    #expect(LiveProtocol.functionCall(from: envelope) == nil)
+}
+
+@Test func functionResultAndContinuationUseLiveResponsesEvents() throws {
+    let result = LiveProtocol.functionResult(callID: "call_123", output: #"{"success":true}"#)
+    #expect(result["type"] as? String == "response.item.create")
+    let item = try #require(result["item"] as? [String: Any])
+    #expect(item["type"] as? String == "function_call_output")
+    #expect(item["call_id"] as? String == "call_123")
+
+    #expect(LiveProtocol.responseCreate()["type"] as? String == "response.create")
+}
+
+@Test func dtmfValidationAcceptsOnlyOneTelephoneKey() {
+    #expect(LiveProtocol.isValidDTMFTone("5"))
+    #expect(LiveProtocol.isValidDTMFTone("#"))
+    #expect(!LiveProtocol.isValidDTMFTone("12"))
+    #expect(!LiveProtocol.isValidDTMFTone("A"))
+    #expect(!LiveProtocol.isValidDTMFTone(""))
+}

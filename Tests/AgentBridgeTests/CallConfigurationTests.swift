@@ -24,7 +24,7 @@ import Testing
     #expect(configuration.insurance == "Example Health")
     #expect(configuration.additionalDetails == "Morning preferred")
     #expect(configuration.gender == .female)
-    #expect(configuration.realtimeVoice == "marin")
+    #expect(configuration.liveVoice == "marin")
     #expect(configuration.spokenLanguage == "German")
 }
 
@@ -32,7 +32,7 @@ import Testing
     let data = Data(#"{"name":"John Doe","dateOfBirth":"1990-05-20","insurance":"Example Health","additionalDetails":"Morning preferred","gender":"male"}"#.utf8)
     let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
 
-    #expect(configuration.realtimeVoice == "cedar")
+    #expect(configuration.liveVoice == "cedar")
 }
 
 @Test func omittedGenderKeepsMarinDefault() throws {
@@ -40,6 +40,6 @@ import Testing
     let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
 
     #expect(configuration.gender == nil)
-    #expect(configuration.realtimeVoice == "marin")
+    #expect(configuration.liveVoice == "marin")
     #expect(configuration.spokenLanguage == "English")
 }

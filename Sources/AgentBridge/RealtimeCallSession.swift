@@ -17,9 +17,134 @@ import Foundation
 import HFPCore
 import Shared
 
-public final class RealtimeCallSession: @unchecked Sendable {
-    public static let model = "gpt-realtime-2.1"
-    // public static let model = "gpt-realtime-2.1-mini"
+struct LiveFunctionCall {
+    let name: String
+    let callID: String
+    let arguments: [String: Any]
+}
+
+enum LiveProtocol {
+    static func sessionStart(
+        voice: String,
+        liveInstructions: String,
+        backendInstructions: String,
+        callerContext: String
+    ) -> [String: Any] {
+        [
+            "type": "session.start",
+            "event_id": "phonebt_session_start",
+            "session": [
+                "model": CallSession.model,
+                "instructions": liveInstructions,
+                "input": [[
+                    "type": "message",
+                    "role": "developer",
+                    "status": "completed",
+                    "content": [[
+                        "type": "input_text",
+                        "text": callerContext,
+                    ]],
+                ]],
+                "audio": [
+                    "format": ["type": "audio/pcm", "rate": 24_000],
+                    "output": ["voice": voice],
+                ],
+                "delegation": [
+                    "type": "responses",
+                    "responses": [
+                        "model": CallSession.backendModel,
+                        "instructions": backendInstructions,
+                        "reasoning": ["effort": "low"],
+                        "parallel_tool_calls": false,
+                        "tools": toolDefinitions,
+                        "tool_choice": "auto",
+                    ],
+                ],
+            ],
+        ]
+    }
+
+    static func audioAppend(_ data: Data) -> [String: Any] {
+        [
+            "type": "session.input_audio.append",
+            "audio": data.base64EncodedString(),
+        ]
+    }
+
+    static func functionCall(from envelope: [String: Any]) -> LiveFunctionCall? {
+        guard let responseEvent = envelope["event"] as? [String: Any],
+              responseEvent["type"] as? String == "response.output_item.done",
+              let item = responseEvent["item"] as? [String: Any],
+              item["type"] as? String == "function_call",
+              let name = item["name"] as? String,
+              let callID = item["call_id"] as? String,
+              let argumentText = item["arguments"] as? String,
+              let data = argumentText.data(using: .utf8),
+              let arguments = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return LiveFunctionCall(name: name, callID: callID, arguments: arguments)
+    }
+
+    static func functionResult(callID: String, output: String) -> [String: Any] {
+        [
+            "type": "response.item.create",
+            "event_id": "phonebt_tool_result_\(UUID().uuidString)",
+            "item": [
+                "type": "function_call_output",
+                "call_id": callID,
+                "output": output,
+            ],
+        ]
+    }
+
+    static func responseCreate() -> [String: Any] {
+        [
+            "type": "response.create",
+            "event_id": "phonebt_continue_\(UUID().uuidString)",
+        ]
+    }
+
+    static func isValidDTMFTone(_ tone: String) -> Bool {
+        tone.count == 1 && tone.first.map { "0123456789*#".contains($0) } == true
+    }
+
+    private static let toolDefinitions: [[String: Any]] = [[
+        "type": "function",
+        "name": "end_call",
+        "description": "Record the outcome and end the call after the spoken goodbye has completed.",
+        "parameters": [
+            "type": "object",
+            "properties": [
+                "status": ["type": "string", "enum": ["booked", "not_booked", "unknown"]],
+                "appointment_date": ["type": "string", "description": "Confirmed appointment date in MM-DD format, or an empty string only when no date was confirmed."],
+                "appointment_time": ["type": "string", "description": "Confirmed local time in HH:mm format, or an empty string."],
+                "practice": ["type": "string", "description": "Practice name, or an empty string."],
+                "notes": ["type": "string", "description": "A useful human-readable summary of the outcome. For a booked appointment, repeat the confirmed date, time, practice, and other important details even though they also have structured fields."],
+            ],
+            "required": ["status", "appointment_date", "appointment_time", "practice", "notes"],
+        ],
+    ], [
+        "type": "function",
+        "name": "send_dtmf",
+        "description": "Silently press one telephone keypad key for an automated IVR menu. Send multi-digit choices one tone at a time in order.",
+        "parameters": [
+            "type": "object",
+            "properties": [
+                "tone": [
+                    "type": "string",
+                    "enum": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#"],
+                    "description": "The single keypad tone to send.",
+                ],
+            ],
+            "required": ["tone"],
+        ],
+    ]]
+}
+
+public final class CallSession: @unchecked Sendable {
+    public static let model = "gpt-live-1"
+    public static let backendModel = "gpt-6.1-sol"
 
     private let apiKey: String
     private let configuration: CallConfiguration
@@ -59,14 +184,15 @@ public final class RealtimeCallSession: @unchecked Sendable {
     public func prepare() {
         stateQueue.async { [weak self] in
             guard let self, self.webSocket == nil, !self.isClosed else { return }
-            guard let url = URL(string: "wss://api.openai.com/v1/realtime?model=\(Self.model)") else { return }
+            guard let url = URL(string: "wss://api.openai.com/v1/live/sessions") else { return }
 
             var request = URLRequest(url: url)
             request.setValue("Bearer \(self.apiKey)", forHTTPHeaderField: "Authorization")
             let socket = URLSession.shared.webSocketTask(with: request)
             self.webSocket = socket
-            self.report("Opening WebSocket for \(Self.model)")
+            self.report("Opening Live WebSocket for \(Self.model)")
             socket.resume()
+            self.sendSessionStart()
             self.receiveTask = Task { [weak self] in await self?.receiveLoop() }
         }
     }
@@ -80,21 +206,27 @@ public final class RealtimeCallSession: @unchecked Sendable {
         stateQueue.sync {
             audioBridge = bridge
         }
-        report("Audio capture connected to Realtime session")
+        report("Audio capture connected to Live session")
     }
 
     public func close() {
-        stateQueue.sync {
-            guard !isClosed else { return }
+        let shouldClose: Bool = stateQueue.sync {
+            guard !isClosed else { return false }
             isClosed = true
-            report("Closing Realtime session")
+            report("Closing GPT-Live session")
             audioBridge?.shutdown()
             audioBridge = nil
             pendingAudio.removeAll()
-            webSocket?.cancel(with: .normalClosure, reason: nil)
-            webSocket = nil
-            receiveTask?.cancel()
-            receiveTask = nil
+            return true
+        }
+        guard shouldClose else { return }
+
+        send([
+            "type": "session.close",
+            "event_id": "phonebt_session_close",
+        ])
+        stateQueue.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.finishTransportClose()
         }
         writeFallbackResultIfNeeded()
         audioDumper?.close()
@@ -109,13 +241,15 @@ public final class RealtimeCallSession: @unchecked Sendable {
                       let data = text.data(using: .utf8),
                       let event = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let type = event["type"] as? String else { continue }
-                if type != "response.output_audio.delta" && type != "response.audio.delta" {
+                if type != "session.output_audio.delta" &&
+                    type != "session.input_transcript.delta" &&
+                    type != "session.output_transcript.delta" {
                     report("Server event: \(type)")
                 }
                 handleEvent(type: type, event: event)
             } catch {
-                if !Task.isCancelled {
-                    logger.error("Realtime connection ended: \(error.localizedDescription)")
+                if !Task.isCancelled, !stateQueue.sync(execute: { isClosed }) {
+                    logger.error("GPT-Live connection ended: \(error.localizedDescription)")
                     report("Connection ended: \(error.localizedDescription)")
                 }
                 return
@@ -125,19 +259,17 @@ public final class RealtimeCallSession: @unchecked Sendable {
 
     private func handleEvent(type: String, event: [String: Any]) {
         switch type {
-        case "session.created":
-            sendSessionConfiguration()
-        case "session.updated":
+        case "session.started":
             stateQueue.async { [weak self] in
                 guard let self else { return }
                 self.isReady = true
                 let buffered = self.pendingAudio
                 self.pendingAudio.removeAll()
                 for data in buffered { self.sendAudioImmediately(data) }
-                self.logger.info("Realtime session ready")
+                self.logger.info("GPT-Live session ready")
                 self.report("Session configured and waiting for the callee to speak")
             }
-        case "response.output_audio.delta":
+        case "session.output_audio.delta":
             if let delta = event["delta"] as? String, let data = Data(base64Encoded: delta) {
                 audioDumper?.appendOutput(data)
                 stateQueue.async { [weak self] in
@@ -147,13 +279,13 @@ public final class RealtimeCallSession: @unchecked Sendable {
                 }
                 stateQueue.sync { audioBridge }?.play(data)
             }
-        case "input_audio_buffer.speech_started":
-            // Keep capturing in parallel, but do not truncate queued phone output.
-            break
-        case "response.function_call_arguments.done":
-            handleFunctionCall(event)
+        case "response.event":
+            handleResponseEvent(event)
+        case "session.closed":
+            report("Live session closed")
+            stateQueue.async { [weak self] in self?.finishTransportClose() }
         case "error":
-            let detail = (event["error"] as? [String: Any])?["message"] as? String ?? "Unknown Realtime API error"
+            let detail = (event["error"] as? [String: Any])?["message"] as? String ?? "Unknown GPT-Live API error"
             logger.error(detail)
             report("API error: \(detail)")
         default:
@@ -161,93 +293,46 @@ public final class RealtimeCallSession: @unchecked Sendable {
         }
     }
 
-    private func sendSessionConfiguration() {
-        send([
-            "type": "session.update",
-            "session": [
-                "type": "realtime",
-                "model": Self.model,
-                "instructions": systemPrompt,
-                "output_modalities": ["audio"],
-                "audio": [
-                    "input": [
-                        "format": ["type": "audio/pcm", "rate": 24_000],
-                        "turn_detection": [
-                            "type": "server_vad",
-                            "create_response": true,
-                            "interrupt_response": false,
-                        ],
-                    ],
-                    "output": [
-                        "format": ["type": "audio/pcm", "rate": 24_000],
-                        "voice": configuration.realtimeVoice,
-                    ],
-                ],
-                "tools": [[
-                        "type": "function",
-                        "name": "end_call",
-                        "description": "Record the outcome and end the call after the spoken goodbye has completed.",
-                        "parameters": [
-                            "type": "object",
-                            "properties": [
-                                "status": ["type": "string", "enum": ["booked", "not_booked", "unknown"]],
-                                "appointment_date": ["type": "string", "description": "Confirmed appointment date in MM-DD format, or an empty string only when no date was confirmed."],
-                                "appointment_time": ["type": "string", "description": "Confirmed local time in HH:mm format, or an empty string."],
-                                "practice": ["type": "string", "description": "Practice name, or an empty string."],
-                                "notes": ["type": "string", "description": "A useful human-readable summary of the outcome. For a booked appointment, repeat the confirmed date, time, practice, and other important details even though they also have structured fields."],
-                            ],
-                            "required": ["status", "appointment_date", "appointment_time", "practice", "notes"],
-                        ],
-                    ], [
-                        "type": "function",
-                        "name": "send_dtmf",
-                        "description": "Silently press one telephone keypad key for an automated IVR menu. Use this as the entire response: do not speak before or after the tool call and do not ask the automated system questions. Send multi-digit choices one tone at a time in order.",
-                        "parameters": [
-                            "type": "object",
-                            "properties": [
-                                "tone": [
-                                    "type": "string",
-                                    "enum": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#"],
-                                    "description": "The single keypad tone to send.",
-                                ],
-                            ],
-                            "required": ["tone"],
-                        ],
-                    ]],
-                "tool_choice": "auto",
-            ],
-        ])
+    private func sendSessionStart() {
+        send(LiveProtocol.sessionStart(
+            voice: configuration.liveVoice,
+            liveInstructions: livePrompt,
+            backendInstructions: backendPrompt,
+            callerContext: callerContext
+        ))
     }
 
-    private func handleFunctionCall(_ event: [String: Any]) {
-        guard let name = event["name"] as? String else { return }
-        let callID = event["call_id"] as? String
-        let arguments = functionArguments(from: event)
+    private func handleResponseEvent(_ envelope: [String: Any]) {
+        guard let call = LiveProtocol.functionCall(from: envelope) else { return }
+        handleFunctionCall(call)
+    }
 
-        if name == "send_dtmf" {
-            performSendDTMF(arguments: arguments, callID: callID)
+    private func handleFunctionCall(_ call: LiveFunctionCall) {
+        if call.name == "send_dtmf" {
+            performSendDTMF(arguments: call.arguments, callID: call.callID)
             return
         }
 
-        guard name == "end_call" else { return }
-        recordResult(arguments: arguments)
+        guard call.name == "end_call" else { return }
+        recordResult(arguments: call.arguments)
         let bridge = stateQueue.sync { audioBridge }
         if let bridge {
             report("Waiting for final audio playback before ending the call")
-            bridge.whenPlaybackFinishes { [weak self] in
-                self?.performEndCall(callID: callID)
+            bridge.whenPlaybackFinishes { [weak self] timedOut in
+                if timedOut {
+                    self?.report("Final playback drain timed out; ending the call safely")
+                }
+                self?.performEndCall(callID: call.callID)
             }
         } else {
-            performEndCall(callID: callID)
+            performEndCall(callID: call.callID)
         }
     }
 
     private func performSendDTMF(arguments: [String: Any], callID: String?) {
         guard let tone = arguments["tone"] as? String,
-              tone.count == 1,
-              let character = tone.first,
-              "0123456789*#".contains(character) else {
-            report("Realtime agent requested an invalid DTMF tone")
+              LiveProtocol.isValidDTMFTone(tone) else {
+            report("GPT-Live backend requested an invalid DTMF tone")
             if let callID {
                 sendFunctionResult(callID: callID, result: "{\"success\":false,\"error\":\"Invalid DTMF tone\"}")
             }
@@ -256,13 +341,13 @@ public final class RealtimeCallSession: @unchecked Sendable {
 
         do {
             try device.sendDTMF(tone)
-            logger.info("Realtime agent sent a DTMF tone")
+            logger.info("GPT-Live backend sent a DTMF tone")
             report("Sent DTMF tone \(tone) through Bluetooth HFP (not the audio stream)")
             if let callID {
                 sendFunctionResult(callID: callID, result: "{\"success\":true}")
             }
         } catch {
-            logger.error("Realtime agent could not send DTMF: \(error.localizedDescription)")
+            logger.error("GPT-Live backend could not send DTMF: \(error.localizedDescription)")
             report("Could not send DTMF tone: \(error.localizedDescription)")
             if let callID {
                 let result = "{\"success\":false,\"error\":\"\(escapeJSON(error.localizedDescription))\"}"
@@ -274,12 +359,12 @@ public final class RealtimeCallSession: @unchecked Sendable {
     private func performEndCall(callID: String?) {
         do {
             try device.endCall()
-            logger.info("Realtime agent ended the call after playback completed")
+            logger.info("GPT-Live backend ended the call after playback completed")
             if let callID {
                 sendFunctionResult(callID: callID, result: "{\"success\":true}")
             }
         } catch {
-            logger.error("Realtime agent could not end the call: \(error.localizedDescription)")
+            logger.error("GPT-Live backend could not end the call: \(error.localizedDescription)")
             if let callID {
                 let result = "{\"success\":false,\"error\":\"\(escapeJSON(error.localizedDescription))\"}"
                 sendFunctionResult(callID: callID, result: result)
@@ -288,21 +373,8 @@ public final class RealtimeCallSession: @unchecked Sendable {
     }
 
     private func sendFunctionResult(callID: String, result: String) {
-        send([
-            "type": "conversation.item.create",
-            "item": [
-                "type": "function_call_output",
-                "call_id": callID,
-                "output": result,
-            ],
-        ])
-    }
-
-    private func functionArguments(from event: [String: Any]) -> [String: Any] {
-        guard let text = event["arguments"] as? String,
-              let data = text.data(using: .utf8),
-              let arguments = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
-        return arguments
+        send(LiveProtocol.functionResult(callID: callID, output: result))
+        send(LiveProtocol.responseCreate())
     }
 
     private func recordResult(arguments: [String: Any]) {
@@ -365,7 +437,7 @@ public final class RealtimeCallSession: @unchecked Sendable {
 
     private func sendAudioImmediately(_ data: Data) {
         audioDumper?.appendInput(data)
-        send(["type": "input_audio_buffer.append", "audio": data.base64EncodedString()])
+        send(LiveProtocol.audioAppend(data))
     }
 
     private func send(_ event: [String: Any]) {
@@ -373,35 +445,74 @@ public final class RealtimeCallSession: @unchecked Sendable {
               let data = try? JSONSerialization.data(withJSONObject: event),
               let text = String(data: data, encoding: .utf8) else { return }
         socket.send(.string(text)) { [logger] error in
-            if let error { logger.error("Realtime send failed: \(error.localizedDescription)") }
+            if let error { logger.error("GPT-Live send failed: \(error.localizedDescription)") }
         }
+    }
+
+    private func finishTransportClose() {
+        webSocket?.cancel(with: .normalClosure, reason: nil)
+        webSocket = nil
+        receiveTask?.cancel()
+        receiveTask = nil
     }
 
     private func report(_ message: String) {
         onDiagnostic(message)
     }
 
-    private var systemPrompt: String {
+    private var livePrompt: String {
         """
-        You are conducting this phone call to make a doctor appointment. Use the caller information below. Introduce yourself as you are speaking onbehalf of the person configured in name. Never introduce yourself as ChatGPT, OpenAI, an AI model, or a virtual assistant. If the other person directly asks whether the call is automated or AI-assisted, answer honestly and briefly.
+        You are making a doctor appointment by phone on behalf of \(configuration.name). Speak in \(configuration.spokenLanguage) with natural vocabulary, pronunciation, and the standard accent appropriate for that language. Speak warmly, clearly, and at a calm, unhurried pace. Never introduce yourself as ChatGPT or OpenAI. If directly asked whether the call is automated or AI-assisted, answer honestly and briefly.
 
-        Conduct the entire conversation in \(configuration.spokenLanguage). Use natural vocabulary, pronunciation, and the standard accent appropriate for that language. Continue using that language even if there is background speech in another language. Switch languages only if the callee explicitly asks you to.
+        Never speak first. Remain silent through ringing, line noise, background speech, and silence. Wait until the person or phone system has finished its initial greeting. Then briefly introduce yourself using the configured name and say that you are calling to make an appointment. Continue in \(configuration.spokenLanguage) unless the callee explicitly asks you to switch languages.
 
-        Never speak first. Remain completely silent until the other person has spoken and finished their initial greeting. A short greeting such as "hello" or "hi" is sufficient. A standard business greeting such as "ABC Medical Practice, how can I help you?" is also sufficient. Only after that greeting is complete, briefly introduce yourself using the configured name and say that you are calling to make an appointment. Do not react to ringing, line noise, silence, or other non-speech audio.
+        Ask or say one short thing at a time, then listen. Do not fill silence, repeat unanswered prompts, answer your own questions, or deliver a monologue. Do not mistake a cough, music, nearby conversation, or background speech for a request.
+        
+        Before concluding that an appointment is booked, make sure both the date and specific time have been stated and confirmed. If either is missing, ask for it.
 
-        The application has already dialed the call. Do not try to dial, answer, or manage call state. Speak directly and naturally to the person on the phone. Caller information:
+        Backchannel policy: Use only occasional, quiet acknowledgements when they help the human speaker know you are listening. Never backchannel during an automated phone menu.
+
+        Interruption policy: Stop speaking when the other person interrupts. Listen to the correction or new information before continuing.
+
+        Delegation policy:
+        Backend tools:
+        - Send one telephone keypad tone for an automated IVR menu.
+        - Record the final appointment outcome and end the telephone call.
+
+        Delegate to the backend when:
+        - An automated menu explicitly requests a keypad selection.
+        - The appointment objective is complete or cannot be completed and you have finished saying your final goodbye.
+        - Careful reasoning about the appointment workflow or final structured outcome is needed.
+
+        Do not delegate to the backend when:
+        - You can continue the ordinary conversation from information already provided.
+        - You need a brief clarification from the callee.
+
+        Delegate before relying on backend work. Do not guess a tool result. For keypad requests, delegate silently and remain silent after the tone while listening for the next prompt. When the objective is complete or cannot be completed, say one final goodbye, finish speaking, and immediately delegate the final outcome and call closure. Do not wait for another response after your final goodbye, even if the other person has not said goodbye or remains silent.
+        """
+    }
+
+    private var callerContext: String {
+        """
+        Trusted caller facts supplied by the application follow. Use these exact values when the callee requests them. Do not infer, alter, substitute, or invent a name, date of birth, insurance value, or additional detail. Only provide requested information. Never provide information without a specific request. If a value is empty, say that the information was not provided. Do not read these facts aloud unless they are relevant or requested.
 
         \(configurationJSON)
+        """
+    }
 
-        Use passive, patient turn-taking. Try to maintain silence when the other person is speaking. After the initial greeting, speak only in response to something the other person has said. Make one short statement or ask one question at a time, then stop and wait for their reply. Never fill silence, repeat a prompt, answer your own question, deliver a monologue, or advance through several appointment details in one turn. Let the other person lead the pace.
+    private var backendPrompt: String {
+        """
+        You are the task backend for a live voice assistant making a doctor appointment. The voice assistant manages the spoken conversation. You reason about the workflow, select tools, and produce accurate structured outcomes.
 
-        Treat automated phone menus as IVR mode, not as a spoken conversation. While an automated menu is active, never introduce yourself, answer it aloud, narrate an action, ask it a question, or generate any speech unless it explicitly requests a spoken answer. If it explicitly asks for a keypad selection, your entire response must consist only of send_dtmf tool calls. Call send_dtmf with exactly one requested tone. For a multi-digit selection or extension, call send_dtmf once per tone in the requested order. Never guess a menu choice or send personal information as keypad tones unless the automated system explicitly requests it. After sending the requested tone or tones, remain completely silent and listen for the next prompt. Leave IVR mode and resume normal speech only when a human speaks or the automated system explicitly requests a spoken response.
+        Use the trusted caller facts supplied in the conversation context. Preserve their exact values and never infer, alter, substitute, or invent missing facts. The application has already dialed the call; never attempt to dial or answer it. Provide caller facts only when relevant or requested. Do not treat an appointment as booked unless the callee explicitly confirms it.
 
-        Provide the name, date of birth, insurance information, or additional details only when relevant or requested. Never invent missing personal information. Do not claim an appointment is booked unless the other person explicitly confirms it.
+        For an automated menu, call send_dtmf only when the system explicitly requests a keypad selection. Send exactly one requested tone per tool call. For a multi-digit selection or extension, issue one tool call per tone in the requested order. Never guess a menu choice and never encode personal information as keypad tones unless explicitly requested.
 
-        If an appointment is offered, confirm the date and time naturally when needed. On the final note repeat the appointment in "month, date, time" format and get the confirmation. When calling end_call for a booked appointment, always populate appointment_date in MM-DD format using the confirmed date from the caller information or conversation, and populate appointment_time when it is known. Also preserve the date, time, practice, and any other useful outcome details in notes as a readable summary; do not omit them merely because they appear in structured fields. Do not mention calendar validation or challenge the callee's stated date unless they explicitly correct it themselves.
-
-        If the objective is completed or cannot be completed, wait until the other person say goodbye, and then call end_call. Never call end_call before your spoken goodbye has finished. Always say have a nice day before calling end_call and wait for the other person to respond as well.
+        If an appointment is offered, make sure the voice conversation confirms the date and time naturally. Preserve the confirmed date, time, practice, and useful details. Do not challenge the callee's stated calendar date unless they correct it.
+        
+        For a booked appointment, populate appointment_date in MM-DD format and appointment_time when known. Repeat the confirmed date, time, practice, and other useful outcome details in notes. Use status not_booked when the appointment could not be made, and unknown only when the outcome genuinely cannot be determined.
+        
+        Once the intent of making an appointment is made or not made, given no appointment are available, call end_call after saying a goodbye greeting. Let make sure the conversation ended naturally. 
         """
     }
 
@@ -418,7 +529,7 @@ public final class RealtimeCallSession: @unchecked Sendable {
     }
 }
 
-/// Writes the exact PCM16 byte streams crossing the Realtime API boundary when
+/// Writes the exact PCM16 byte streams crossing the GPT-Live API boundary when
 /// `PHONEBT_AUDIO_DUMP_DIR` is set. Writes are serialized off the audio path.
 private final class RealtimeAudioDumper: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.phonebt.realtime.audio-dump")
@@ -443,10 +554,10 @@ private final class RealtimeAudioDumper: @unchecked Sendable {
             FileManager.default.createFile(atPath: outputURL.path, contents: nil)
 
             let dumper = try RealtimeAudioDumper(inputURL: inputURL, outputURL: outputURL)
-            logger.info("Realtime audio dump enabled: \(inputURL.path), \(outputURL.path)")
+            logger.info("GPT-Live audio dump enabled: \(inputURL.path), \(outputURL.path)")
             return dumper
         } catch {
-            logger.error("Could not enable Realtime audio dump: \(error.localizedDescription)")
+            logger.error("Could not enable GPT-Live audio dump: \(error.localizedDescription)")
             return nil
         }
     }

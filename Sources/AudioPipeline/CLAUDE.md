@@ -1,6 +1,6 @@
 # CLAUDE.md — Sources/AudioPipeline
 
-This target owns CoreAudio device discovery, system routing, the shared `AVAudioEngine`, and the raw audio bridge used by the OpenAI Realtime API. It depends only on `Shared`.
+This target owns CoreAudio device discovery, system routing, the shared `AVAudioEngine`, and the raw audio bridge used by OpenAI GPT-Live. It depends only on `Shared`.
 
 - `AudioDeviceManager.swift` enumerates and selects CoreAudio devices.
 - `AudioRouter.swift` temporarily switches the default input/output devices and restores them after a call.

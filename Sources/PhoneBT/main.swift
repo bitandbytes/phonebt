@@ -26,7 +26,7 @@ let audioRouter = AudioRouter(preferredDeviceName: callAudioDeviceName)
 var hfpDevice: HFPDevice?
 var discoveredDevices: [DiscoveredDevice] = []
 var audioSessionManager: AudioSessionManager?
-var realtimeSession: RealtimeCallSession?
+var callSession: CallSession?
 var audioStartTask: Task<Void, Never>?
 var activeAudioDevice: AudioDeviceInfo?
 var isRunning = true
@@ -37,7 +37,7 @@ func printBanner() {
 
     ╔══════════════════════════════════════╗
     ║          PhoneBT v0.2.0              ║
-    ║  Realtime AI Phone Calls for macOS   ║
+    ║   GPT-Live Phone Calls for macOS     ║
     ╚══════════════════════════════════════╝
     """)
 }
@@ -64,8 +64,8 @@ func printHelp() {
 func cleanupCall() {
     audioStartTask?.cancel()
     audioStartTask = nil
-    realtimeSession?.close()
-    realtimeSession = nil
+    callSession?.close()
+    callSession = nil
     audioSessionManager?.stop()
     audioSessionManager = nil
     activeAudioDevice = nil
@@ -218,32 +218,32 @@ func handleCall(argument: String) {
     let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
     let resultName = "\(call.configURL.deletingPathExtension().lastPathComponent)-\(timestamp)-appointment-result.json"
     let resultURL = call.configURL.deletingLastPathComponent().appendingPathComponent(resultName)
-    let session = RealtimeCallSession(
+    let session = CallSession(
         apiKey: apiKey,
         configuration: configuration,
         resultURL: resultURL,
         device: device
     ) { message in
-        print("\n[Realtime] \(message)")
+        print("\n[GPT-Live] \(message)")
         print("phonebt> ", terminator: "")
         fflush(stdout)
     }
-    realtimeSession = session
+    callSession = session
     session.prepare()
 
     do {
         try device.dial(number: call.number)
         try? device.transferAudioToComputer()
-        print("Dialing \(call.number)… Realtime session is preparing.")
+        print("Dialing \(call.number)… GPT-Live session is preparing.")
     } catch {
         session.close()
-        realtimeSession = nil
+        callSession = nil
         print("Dial failed: \(error.localizedDescription)")
     }
 }
 
 func startCallAudioWhenAvailable(attempts: Int = 20) async {
-    guard audioSessionManager == nil, let realtimeSession else { return }
+    guard audioSessionManager == nil, let callSession else { return }
 
     for _ in 0..<attempts {
         if Task.isCancelled { return }
@@ -253,13 +253,13 @@ func startCallAudioWhenAvailable(attempts: Int = 20) async {
             do {
                 try manager.configure(deviceID: audioDevice.id)
                 try manager.start()
-                try realtimeSession.startAudio(using: manager)
+                try callSession.startAudio(using: manager)
                 audioSessionManager = manager
                 activeAudioDevice = audioDevice
-                print("Realtime audio started on \(audioDevice.name).")
+                print("GPT-Live audio started on \(audioDevice.name).")
             } catch {
                 manager.stop()
-                print("Could not start Realtime audio: \(error.localizedDescription)")
+                print("Could not start GPT-Live audio: \(error.localizedDescription)")
             }
             return
         }
@@ -296,7 +296,7 @@ func handleEvent(_ event: HFPEvent) {
         cleanupCall()
         hfpDevice = nil
     case .incomingCall:
-        print("\nIncoming calls are not handled by the Realtime agent in this version.")
+        print("\nIncoming calls are not handled by the GPT-Live agent in this version.")
     default:
         break
     }
@@ -336,7 +336,7 @@ func handleStatus() {
     print("Connection: \(state.connection.rawValue)")
     print("Call: \(state.call.rawValue)")
     print("HFP audio: \(state.audio.rawValue)")
-    print("Realtime: \(realtimeSession == nil ? "inactive" : "prepared")")
+    print("GPT-Live: \(callSession == nil ? "inactive" : "prepared")")
     if let call = state.activeCall {
         print("Number: \(call.number ?? "unknown")")
         if let duration = call.durationDescription { print("Duration: \(duration)") }

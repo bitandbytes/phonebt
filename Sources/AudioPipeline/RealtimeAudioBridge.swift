@@ -16,8 +16,13 @@ import AVFoundation
 import Foundation
 import Shared
 
-/// Converts between the call device's native format and Realtime API PCM16 audio.
+/// Converts between the call device's native format and GPT-Live PCM16 audio.
 public final class RealtimeAudioBridge: @unchecked Sendable {
+    private struct PlaybackCompletionWaiter {
+        let id: UUID
+        let completion: @Sendable (Bool) -> Void
+    }
+
     public static let sampleRate = 24_000.0
 
     private static let inputGateThresholdDBFS = -38.0
@@ -28,7 +33,9 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     private let logger = PhoneBTLogger(category: .audio)
     private var isCapturing = false
     private var pendingPlaybackBuffers = 0
-    private var playbackCompletionHandlers: [@Sendable () -> Void] = []
+    private var playbackGeneration = 0
+    private var settleCheckScheduled = false
+    private var playbackCompletionWaiters: [PlaybackCompletionWaiter] = []
 
     public init(sessionManager: AudioSessionManager) {
         self.sessionManager = sessionManager
@@ -137,7 +144,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
 
         isCapturing = true
         logger.info(
-            "Realtime audio capture started at 24 kHz PCM16 with " +
+            "GPT-Live audio capture started at 24 kHz PCM16 with " +
             "\(Self.inputGateThresholdDBFS) dBFS input gate"
         )
     }
@@ -146,7 +153,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
         guard isCapturing else { return }
         sessionManager.engine.inputNode.removeTap(onBus: 0)
         isCapturing = false
-        logger.info("Realtime audio capture stopped")
+        logger.info("GPT-Live audio capture stopped")
     }
 
     public func play(_ pcm16Data: Data) {
@@ -167,13 +174,29 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
         }
     }
 
-    public func whenPlaybackFinishes(_ completion: @escaping @Sendable () -> Void) {
+    /// Calls `completion` after queued audio plays, or after `maximumWait` if an
+    /// AVAudioPlayerNode completion callback is lost. The argument is true on timeout.
+    public func whenPlaybackFinishes(
+        maximumWait: TimeInterval = 3,
+        _ completion: @escaping @Sendable (Bool) -> Void
+    ) {
         playbackQueue.async { [weak self] in
             guard let self else { return }
-            if self.pendingPlaybackBuffers == 0 {
-                completion()
-            } else {
-                self.playbackCompletionHandlers.append(completion)
+            let waiter = PlaybackCompletionWaiter(id: UUID(), completion: completion)
+            self.playbackCompletionWaiters.append(waiter)
+            self.schedulePlaybackSettlementCheckIfNeeded()
+            self.playbackQueue.asyncAfter(deadline: .now() + maximumWait) { [weak self] in
+                guard let self,
+                      let index = self.playbackCompletionWaiters.firstIndex(where: { $0.id == waiter.id }) else {
+                    return
+                }
+                let timedOutWaiter = self.playbackCompletionWaiters.remove(at: index)
+                self.logger.error(
+                    "Playback drain timed out with \(self.pendingPlaybackBuffers) buffer(s) pending"
+                )
+                DispatchQueue.global().async {
+                    timedOutWaiter.completion(true)
+                }
             }
         }
     }
@@ -228,6 +251,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
             return
         }
 
+        playbackGeneration += 1
         pendingPlaybackBuffers += 1
         sessionManager.playerNode.scheduleBuffer(
             outputBuffer,
@@ -237,7 +261,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
                 guard let self else { return }
                 self.pendingPlaybackBuffers = max(0, self.pendingPlaybackBuffers - 1)
                 if self.pendingPlaybackBuffers == 0 {
-                    self.finishPlaybackWaiters()
+                    self.schedulePlaybackSettlementCheckIfNeeded()
                 }
             }
         }
@@ -247,10 +271,33 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     }
 
     private func finishPlaybackWaiters() {
-        let handlers = playbackCompletionHandlers
-        playbackCompletionHandlers.removeAll()
-        for handler in handlers {
-            DispatchQueue.global().async(execute: handler)
+        let waiters = playbackCompletionWaiters
+        playbackCompletionWaiters.removeAll()
+        for waiter in waiters {
+            DispatchQueue.global().async {
+                waiter.completion(false)
+            }
+        }
+    }
+
+    /// GPT-Live has no per-utterance audio-done event. Require a short quiet
+    /// interval after the local playback queue drains before treating speech as complete.
+    private func schedulePlaybackSettlementCheckIfNeeded() {
+        guard pendingPlaybackBuffers == 0,
+              !playbackCompletionWaiters.isEmpty,
+              !settleCheckScheduled else { return }
+
+        settleCheckScheduled = true
+        let generation = playbackGeneration
+        playbackQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.settleCheckScheduled = false
+            guard self.pendingPlaybackBuffers == 0,
+                  self.playbackGeneration == generation else {
+                self.schedulePlaybackSettlementCheckIfNeeded()
+                return
+            }
+            self.finishPlaybackWaiters()
         }
     }
 }

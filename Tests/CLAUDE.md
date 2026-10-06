@@ -6,7 +6,7 @@ Unit tests cover pure HFP state logic and call-configuration decoding. Hardware-
 
 - `HFPCoreTests/` — `HFPStateMachineTests.swift`: drives `HFPStateMachine.handleEvent(_:)` with `HFPEvent` sequences and asserts on `currentState` (connection/call/audio/activeCall transitions, CIEV indicator semantics, disconnect-resets-everything). Also the natural home for `ATParser` tests.
 
-- `AgentBridgeTests/` — `CallConfigurationTests.swift`: uses Swift Testing to verify the input JSON contract without a live Realtime session.
+- `AgentBridgeTests/` — uses Swift Testing to verify the input JSON contract and pure GPT-Live protocol construction/parsing without a live API session.
 ## Conventions
 
 - Match the framework already used by the target: legacy `HFPCoreTests` uses XCTest, while new `AgentBridgeTests` uses Swift Testing.
