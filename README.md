@@ -2,7 +2,7 @@
 
 PhoneBT is a macOS command-line HFP client that places a cellular call through a paired phone and connects the established call directly to OpenAI's `gpt-realtime-2.1` model.
 
-The phone and `IOBluetoothHandsFreeDevice` callbacks are authoritative for connection, call, and SCO state. The model does not dial or answer calls. Once HFP reports an active outgoing call, PhoneBT streams call audio to the Realtime API and plays model audio back to the selected call device. The model can invoke `end_call` after it has concluded the conversation.
+The phone and `IOBluetoothHandsFreeDevice` callbacks are authoritative for connection, call, and SCO state. The model does not dial or answer calls. Once HFP reports an active outgoing call, PhoneBT streams call audio to the Realtime API and plays model audio back to the selected call device. The model can invoke `send_dtmf` to navigate an automated phone menu and `end_call` after it has concluded the conversation. DTMF is sent as an out-of-band Bluetooth HFP command to the phone; it is not mixed into the Realtime PCM audio stream.
 
 ## Requirements
 
@@ -89,7 +89,7 @@ log stream --level debug --predicate 'subsystem == "com.phonebt"'
 
 - `HFPCore` owns Bluetooth HFP callbacks, commands, the event stream, and call state.
 - `AudioPipeline` owns CoreAudio device routing and PCM16 conversion for Realtime audio.
-- `AgentBridge` owns call configuration, result JSON persistence, the OpenAI Realtime WebSocket session, and its `end_call` tool.
+- `AgentBridge` owns call configuration, result JSON persistence, the OpenAI Realtime WebSocket session, and its `send_dtmf` and `end_call` tools.
 - `PhoneBT` owns the terminal commands and wires call events to session lifecycle.
 
 There is intentionally no separate STT, TTS, text LLM, model selector, or agent mode. The Realtime model consumes and produces audio directly.

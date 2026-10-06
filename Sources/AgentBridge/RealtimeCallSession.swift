@@ -198,6 +198,21 @@ public final class RealtimeCallSession: @unchecked Sendable {
                             ],
                             "required": ["status", "appointment_date", "appointment_time", "practice", "notes"],
                         ],
+                    ], [
+                        "type": "function",
+                        "name": "send_dtmf",
+                        "description": "Silently press one telephone keypad key for an automated IVR menu. Use this as the entire response: do not speak before or after the tool call and do not ask the automated system questions. Send multi-digit choices one tone at a time in order.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "tone": [
+                                    "type": "string",
+                                    "enum": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#"],
+                                    "description": "The single keypad tone to send.",
+                                ],
+                            ],
+                            "required": ["tone"],
+                        ],
                     ]],
                 "tool_choice": "auto",
             ],
@@ -209,6 +224,11 @@ public final class RealtimeCallSession: @unchecked Sendable {
         let callID = event["call_id"] as? String
         let arguments = functionArguments(from: event)
 
+        if name == "send_dtmf" {
+            performSendDTMF(arguments: arguments, callID: callID)
+            return
+        }
+
         guard name == "end_call" else { return }
         recordResult(arguments: arguments)
         let bridge = stateQueue.sync { audioBridge }
@@ -219,6 +239,35 @@ public final class RealtimeCallSession: @unchecked Sendable {
             }
         } else {
             performEndCall(callID: callID)
+        }
+    }
+
+    private func performSendDTMF(arguments: [String: Any], callID: String?) {
+        guard let tone = arguments["tone"] as? String,
+              tone.count == 1,
+              let character = tone.first,
+              "0123456789*#".contains(character) else {
+            report("Realtime agent requested an invalid DTMF tone")
+            if let callID {
+                sendFunctionResult(callID: callID, result: "{\"success\":false,\"error\":\"Invalid DTMF tone\"}")
+            }
+            return
+        }
+
+        do {
+            try device.sendDTMF(tone)
+            logger.info("Realtime agent sent a DTMF tone")
+            report("Sent DTMF tone \(tone) through Bluetooth HFP (not the audio stream)")
+            if let callID {
+                sendFunctionResult(callID: callID, result: "{\"success\":true}")
+            }
+        } catch {
+            logger.error("Realtime agent could not send DTMF: \(error.localizedDescription)")
+            report("Could not send DTMF tone: \(error.localizedDescription)")
+            if let callID {
+                let result = "{\"success\":false,\"error\":\"\(escapeJSON(error.localizedDescription))\"}"
+                sendFunctionResult(callID: callID, result: result)
+            }
         }
     }
 
@@ -345,6 +394,8 @@ public final class RealtimeCallSession: @unchecked Sendable {
         \(configurationJSON)
 
         Use passive, patient turn-taking. Try to maintain silence when the other person is speaking. After the initial greeting, speak only in response to something the other person has said. Make one short statement or ask one question at a time, then stop and wait for their reply. Never fill silence, repeat a prompt, answer your own question, deliver a monologue, or advance through several appointment details in one turn. Let the other person lead the pace.
+
+        Treat automated phone menus as IVR mode, not as a spoken conversation. While an automated menu is active, never introduce yourself, answer it aloud, narrate an action, ask it a question, or generate any speech unless it explicitly requests a spoken answer. If it explicitly asks for a keypad selection, your entire response must consist only of send_dtmf tool calls. Call send_dtmf with exactly one requested tone. For a multi-digit selection or extension, call send_dtmf once per tone in the requested order. Never guess a menu choice or send personal information as keypad tones unless the automated system explicitly requests it. After sending the requested tone or tones, remain completely silent and listen for the next prompt. Leave IVR mode and resume normal speech only when a human speaks or the automated system explicitly requests a spoken response.
 
         Provide the name, date of birth, insurance information, or additional details only when relevant or requested. Never invent missing personal information. Do not claim an appointment is booked unless the other person explicitly confirms it.
 

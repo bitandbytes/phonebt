@@ -16,7 +16,7 @@ all targets ← PhoneBT executable
 - `Shared`: value models and logging only.
 - `HFPCore`: IOBluetooth discovery, commands, callbacks, event stream, and authoritative HFP state.
 - `AudioPipeline`: CoreAudio selection/routing, one shared audio engine, and 24 kHz PCM16 conversion.
-- `AgentBridge`: call configuration and result models, result persistence, and the OpenAI Realtime WebSocket session with its `end_call` tool.
+- `AgentBridge`: call configuration and result models, result persistence, and the OpenAI Realtime WebSocket session with its `send_dtmf` and `end_call` tools.
 - `PhoneBT`: terminal commands and lifecycle wiring.
 
 HFP callbacks—not the model—own call state. The CLI loads `call <number> --config <file>`, dials, and prepares the Realtime session. Only `.callActive` starts audio streaming. Call end/disconnect closes the session, writes the timestamped appointment-result JSON beside the input configuration, stops audio, and restores routing. The model may end an active call after completing the conversation; terminal `hangup` remains a safety override.
