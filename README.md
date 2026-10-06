@@ -1,161 +1,110 @@
 # PhoneBT
 
-A macOS Bluetooth Hands-Free Profile (HFP) client that connects to an iPhone or Android phone, allowing a Claude AI agent to make and receive phone calls through the phone's cellular connection.
+PhoneBT is a macOS command-line HFP client that places a cellular call through a paired phone and connects the established call directly to OpenAI's `gpt-realtime-2.1` model.
 
-The Mac acts as the Hands-Free (HF) unit; the phone acts as the Audio Gateway (AG).
-
-## How It Works
-
-PhoneBT uses Apple's `IOBluetoothHandsFreeDevice` framework to establish an HFP Service Level Connection with a paired phone. Once connected, it can:
-
-- **Dial numbers** and place outgoing calls
-- **Answer or reject** incoming calls
-- **Send DTMF tones** for navigating phone menus
-- **Route audio** through the Mac's speakers and microphone via Bluetooth SCO
-- **Hear callers** via on-device speech-to-text (Apple `SFSpeechRecognizer`)
-- **Speak to callers** via text-to-speech (ElevenLabs API)
-- **Report phone status** including signal strength, battery level, and carrier
-
-In AI agent mode, Claude controls the phone through a tool-use conversation loop — you describe what you want in natural language, and Claude executes the appropriate phone commands. During active calls, Claude can hear what the caller says (via real-time transcription) and speak back to them (via TTS), enabling fully autonomous phone conversations.
+The phone and `IOBluetoothHandsFreeDevice` callbacks are authoritative for connection, call, and SCO state. The model does not dial or answer calls. Once HFP reports an active outgoing call, PhoneBT streams call audio to the Realtime API and plays model audio back to the selected call device. The model can invoke `end_call` after it has concluded the conversation.
 
 ## Requirements
 
-- macOS 13 (Ventura) or later
-- A Bluetooth-paired iPhone or Android phone
-- Swift 5.9+
-- `ANTHROPIC_API_KEY` environment variable (for AI agent mode)
-- `ELEVENLABS_API_KEY` environment variable (optional, for TTS during calls)
-- A CoreAudio device carrying the call audio — by default a USB audio adapter named
-  "USB Advanced Audio Device". Override the name with `PHONEBT_AUDIO_DEVICE`
-  (case-insensitive substring match). A Bluetooth SCO device is used as fallback.
+- macOS 13 or later
+- Swift 5.9 or later
+- A paired iPhone or Android phone exposing the HFP Audio Gateway service
+- A full-duplex CoreAudio device carrying the call audio
+- `OPENAI_API_KEY`
 
-## Building
+The default audio-device name is `USB Advanced Audio Device`. Set `PHONEBT_AUDIO_DEVICE` to override the case-insensitive name match, or select a device interactively.
 
-```bash
-swift build
-swift build --build-system native
-```
+For audio-path debugging, set `PHONEBT_AUDIO_DUMP_DIR` to a writable directory. Each call writes two raw mono, 24 kHz, signed 16-bit little-endian PCM files: `*-agent-input.pcm` contains the bytes sent to the Realtime API, and `*-agent-output.pcm` contains the bytes received from it. These files may contain sensitive call audio and are not created unless the variable is set.
 
-## Running
+## Run
 
 ```bash
+export OPENAI_API_KEY=sk-...
 swift run PhoneBT
 swift run --build-system native PhoneBT
 ```
 
-### Interactive CLI
+Typical flow. First create a call configuration, for example `appointment.json`:
 
-```
-phonebt> paired           # List paired Bluetooth devices
-phonebt> connect 2        # Connect to device at index 2
-phonebt> dial +15551234567 # Place a call
-phonebt> answer           # Answer an incoming call
-phonebt> hangup           # End the current call
-phonebt> dtmf 1           # Send a DTMF tone
-phonebt> status           # Show call statussw
-phonebt> phone            # Show phone status (signal, battery, carrier)
-phonebt> audio            # List Bluetooth audio devices
-phonebt> agent            # Enter AI agent mode
-phonebt> quit             # Exit
+```json
+{
+  "name": "Max Mustermann",
+  "dateOfBirth": "1990-05-20",
+  "insurance": "Example Health, member 123456",
+  "additionalDetails": "Request a routine appointment, preferably in the morning.",
+  "gender": "male",
+  "language": "German"
+}
 ```
 
-### AI Agent Mode
+`gender` controls the Realtime output voice: `male` selects `cedar`, while `female` selects `marin`. The field is optional and defaults to `female`/`marin` for compatibility with existing configuration files. This is a PhoneBT voice-selection convention; OpenAI identifies these as named voices rather than assigning official genders to them.
 
-Set your API keys and enter agent mode after connecting to a phone:
+`language` controls the language used throughout the conversation, for example `"English"`, `"German"`, or `"French"`. It is optional and defaults to English. PhoneBT applies it through the Realtime session instructions because native speech-to-speech sessions do not have a separate output-language setting.
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export ELEVENLABS_API_KEY=xi-...    # optional, enables TTS
-swift run PhoneBT
-```
+Then start the call:
 
-```
+```text
 phonebt> paired
-phonebt> connect 2
-phonebt> agent
-
-agent> Call my voicemail
-Agent: I'll dial *86 for you now.
-[tool_use: dial_number(*86)]
-Agent: Your voicemail is ringing. I'll let you know when it connects.
-
-agent> Check the phone battery
-Agent: Your phone is at 4/5 battery with 1/5 signal strength on T-Mobile.
-
-agent> exit
+phonebt> connect 0
+phonebt> devices
+phonebt> setdevice 2
+phonebt> verbose on
+phonebt> call +15551234567 --config /path/to/appointment.json
 ```
 
-The agent automatically receives incoming call notifications and can answer or reject them on your behalf.
+The Realtime session is prepared while the phone is dialing. Audio capture and playback begin only after the HFP call-active callback. `hangup` remains available as a terminal safety override. When the call ends, PhoneBT writes a timestamped `*-appointment-result.json` beside the input configuration.
 
-### Real-Time Voice Conversations
+A booked appointment result has this format:
 
-When a call becomes active (or SCO audio connects), the audio pipeline starts automatically on the call audio device (see `PHONEBT_AUDIO_DEVICE`); TTS additionally requires `ELEVENLABS_API_KEY`:
-
-1. **Caller speech** is transcribed in real-time via Apple's on-device `SFSpeechRecognizer`
-2. Transcriptions appear as `[CALLER SPEECH]` events in agent mode
-3. Claude responds using the `say_to_caller` tool, which converts text to speech via ElevenLabs
-4. The caller hears Claude's response through the phone
-
-```
-🔊 Audio connected
-🗣️  Caller: "Hi, I'm calling about my appointment"
-Agent: [tool_use: say_to_caller("Hello! I'd be happy to help with your appointment. Could you give me your name?")]
-🗣️  Caller: "Sure, it's John Smith"
+```json
+{
+  "status": "booked",
+  "appointmentDate": "10-15",
+  "appointmentTime": "14:30",
+  "practice": "ABC Medical Practice",
+  "notes": "Routine appointment confirmed by the practice."
+}
 ```
 
-Speech recognition authorization is requested on first launch. Echo cancellation is enabled automatically on macOS 14+.
+`appointmentDate` uses `MM-DD` without a year. `notes` retains a readable summary including the confirmed date, time, practice, and other useful call details, even when those values also appear in structured fields. `status` is `booked`, `not_booked`, or `unknown`. Optional appointment fields are omitted when unavailable. If the call ends without a structured outcome, PhoneBT writes an `unknown` result.
 
-## Project Structure
-
-```
-Sources/
-├── PhoneBT/main.swift              # CLI entry point
-├── HFPCore/
-│   ├── BluetoothManager.swift      # Device discovery & pairing
-│   ├── HFPDevice.swift             # IOBluetoothHandsFreeDevice wrapper
-│   ├── HFPStateMachine.swift       # Connection/call/audio state tracking
-│   ├── HFPDelegate.swift           # HFP delegate → event stream
-│   ├── HFPEvents.swift             # AsyncStream-based event distribution
-│   └── ATCommandExtensions.swift   # AT response parsers (CLCC, COPS, CLIP)
-├── AudioPipeline/
-│   ├── AudioSessionManager.swift   # Shared AVAudioEngine for full-duplex BT audio
-│   ├── AudioCapture.swift          # STT via SFSpeechRecognizer (on-device)
-│   ├── TTSPlayer.swift             # TTS via ElevenLabs API
-│   ├── AudioRouter.swift           # SCO ↔ CoreAudio bridge
-│   └── AudioDeviceManager.swift    # System audio device management
-├── AgentBridge/
-│   ├── ClaudeAgent.swift           # Tool-use conversation loop
-│   ├── PhoneTools.swift            # Tool definitions for Claude
-│   └── ToolExecutor.swift          # Tool call → HFP command dispatch
-└── Shared/
-    ├── CallState.swift             # Call info model
-    └── Logger.swift                # os_log wrapper
-```
-
-## Testing
+Input and output audio to and from the AI model can be dumped by setting:
 
 ```bash
+export PHONEBT_AUDIO_DUMP_DIR=/tmp/phonebt-audio
+```
+
+PCM files could be imported to Audacity or could be played using
+```bash
+ffplay -f s16le -ar 24000 -ac 1 /tmp/phonebt-audio/<file>.pcm
+```
+
+Realtime connection and API events are printed in the terminal. `verbose on` additionally prints every HFP callback event. To inspect the complete macOS unified logs in another terminal, run:
+
+```bash
+log stream --level debug --predicate 'subsystem == "com.phonebt"'
+```
+
+## Architecture
+
+- `HFPCore` owns Bluetooth HFP callbacks, commands, the event stream, and call state.
+- `AudioPipeline` owns CoreAudio device routing and PCM16 conversion for Realtime audio.
+- `AgentBridge` owns call configuration, result JSON persistence, the OpenAI Realtime WebSocket session, and its `end_call` tool.
+- `PhoneBT` owns the terminal commands and wires call events to session lifecycle.
+
+There is intentionally no separate STT, TTS, text LLM, model selector, or agent mode. The Realtime model consumes and produces audio directly.
+
+## Build and test
+
+```bash
+swift build
+swift build --build-system native
+
 swift test
 ```
 
-30 tests covering the HFP state machine and tool executor (including `say_to_caller`).
-
-## Debug Logs
-
-```bash
-log stream --level debug --predicate 'subsystem == "com.phonebt"
-```
-
-## Known Limitations
-
-- **SCO audio routing** depends on macOS exposing the Bluetooth SCO channel as a CoreAudio device, which may not work with all phone/Mac combinations. The `transferAudioToComputer()` API is attempted first, with manual CoreAudio routing as a fallback.
-- **Entitlements**: On newer macOS versions, Bluetooth access may require specific entitlements or code signing. If device discovery fails, try running from Xcode with the Bluetooth entitlement enabled.
-- **Speech recognition** requires user authorization on first use. The app requests this at startup. On-device recognition is preferred when available.
-- **Echo cancellation** uses `AVAudioEngine` voice processing on macOS 14+. On macOS 13, input may pick up TTS playback.
-- The AI agent uses Claude 3.7 Sonnet by default. You can change the model in `ClaudeAgent.swift`.
+Hardware and live API behavior require an end-to-end call test; unit tests cover the pure HFP state machine and call-configuration decoding.
 
 ## License
 
-Copyright 2026 ICOA Inc.
-
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Copyright 2026 ICOA Inc. Licensed under the Apache License, Version 2.0.

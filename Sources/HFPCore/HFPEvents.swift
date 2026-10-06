@@ -50,9 +50,6 @@ public enum HFPEvent: Sendable {
     // Operator
     case operatorName(String)
 
-    // Caller speech (transcription from STT)
-    case callerSpeech(String)
-
     // Error
     case error(String)
 }

@@ -38,6 +38,28 @@ public final class AudioSessionManager: @unchecked Sendable {
         try setDevice(inputDeviceID, on: inputUnit)
         try setDevice(outputDeviceID, on: outputUnit)
 
+        setDeviceVolume(
+            deviceID: inputDeviceID,
+            scope: kAudioDevicePropertyScopeInput,
+            element: kAudioObjectPropertyElementMain,
+            decibels: 1.0,
+            label: "input master"
+        )
+        setDeviceVolume(
+            deviceID: outputDeviceID,
+            scope: kAudioDevicePropertyScopeOutput,
+            element: 1,
+            decibels: -38.0,
+            label: "output left"
+        )
+        setDeviceVolume(
+            deviceID: outputDeviceID,
+            scope: kAudioDevicePropertyScopeOutput,
+            element: 2,
+            decibels: -38.0,
+            label: "output right"
+        )
+
         // Connect player node to output
         let outputFormat = engine.outputNode.inputFormat(forBus: 0)
         engine.connect(playerNode, to: engine.mainMixerNode, format: outputFormat)
@@ -59,11 +81,11 @@ public final class AudioSessionManager: @unchecked Sendable {
     }
 
     public func start() throws {
-        // Enable voice processing for echo cancellation (macOS 14+)
+        // Keep line-level phone audio unprocessed; microphone AEC can suppress the remote caller.
         if #available(macOS 14.0, *) {
             do {
-                try engine.inputNode.setVoiceProcessingEnabled(true)
-                logger.info("Voice processing (AEC) enabled")
+                try engine.inputNode.setVoiceProcessingEnabled(false)
+                logger.info("Voice processing (AEC) disabled for line-level call audio")
             } catch {
                 logger.error("Failed to enable voice processing: \(error)")
             }
@@ -96,6 +118,52 @@ public final class AudioSessionManager: @unchecked Sendable {
         guard status == noErr else {
             throw AudioSessionError.deviceConfigFailed(status)
         }
+    }
+}
+
+private extension AudioSessionManager {
+    /// Sets a hardware volume control in decibels when the selected device exposes it.
+    /// Fixed-volume devices are left unchanged so they can still be used for calls.
+    func setDeviceVolume(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope,
+        element: AudioObjectPropertyElement,
+        decibels: Float32,
+        label: String
+    ) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeDecibels,
+            mScope: scope,
+            mElement: element
+        )
+
+        guard AudioObjectHasProperty(deviceID, &address) else {
+            logger.error("Selected device has no \(label) volume control")
+            return
+        }
+
+        var isSettable = DarwinBoolean(false)
+        let settableStatus = AudioObjectIsPropertySettable(deviceID, &address, &isSettable)
+        guard settableStatus == noErr, isSettable.boolValue else {
+            logger.error("Selected device's \(label) volume control is not writable")
+            return
+        }
+
+        var value = decibels
+        let status = AudioObjectSetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<Float32>.size),
+            &value
+        )
+        guard status == noErr else {
+            logger.error("Could not set selected device \(label) to \(decibels) dB (OSStatus \(status))")
+            return
+        }
+
+        logger.info("Selected device \(label) set to \(decibels) dB")
     }
 }
 

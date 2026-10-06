@@ -12,646 +12,374 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import AgentBridge
+import AudioPipeline
 import Foundation
 import HFPCore
-import AudioPipeline
-import AgentBridge
 import Shared
 
-// MARK: - CLI Application
-
 let logger = PhoneBTLogger(category: .app)
+let callAudioDeviceName = ProcessInfo.processInfo.environment["PHONEBT_AUDIO_DEVICE"] ?? "USB Advanced Audio Device"
+let bluetoothManager = BluetoothManager()
+let audioRouter = AudioRouter(preferredDeviceName: callAudioDeviceName)
+
+var hfpDevice: HFPDevice?
+var discoveredDevices: [DiscoveredDevice] = []
+var audioSessionManager: AudioSessionManager?
+var realtimeSession: RealtimeCallSession?
+var audioStartTask: Task<Void, Never>?
+var activeAudioDevice: AudioDeviceInfo?
+var isRunning = true
+var verboseLogging = ProcessInfo.processInfo.environment["PHONEBT_VERBOSE"] == "1"
 
 func printBanner() {
     print("""
 
     ╔══════════════════════════════════════╗
-    ║          PhoneBT v0.1.0              ║
-    ║  Bluetooth HFP Client for macOS      ║
-    ║  AI-Driven Phone Call Management     ║
+    ║          PhoneBT v0.2.0              ║
+    ║  Realtime AI Phone Calls for macOS   ║
     ╚══════════════════════════════════════╝
     """)
 }
 
 func printHelp() {
     print("""
+
     Commands:
-      scan              - Scan for Bluetooth devices
-      paired            - List paired devices
-      connect <idx>     - Connect to device by index
-      disconnect        - Disconnect current device
-      dial <number>     - Dial a phone number
-      answer            - Answer incoming call
-      hangup            - End current call
-      dtmf <digit>      - Send DTMF tone
-      status            - Show call status
-      phone             - Show phone status
-      devices           - List audio devices
-      setdevice <idx>   - Select audio device for calls
-      set <key> <val>   - Configure settings (tts.voice, tts.model)
-      model <name>      - Set LLM model (e.g. claude-sonnet-4-6, gpt-4o)
-      agent             - Enter AI agent mode
-      help              - Show this help
-      quit              - Exit PhoneBT
+      paired                         - List paired HFP phones
+      scan                           - Scan for Bluetooth devices
+      connect <idx>                  - Connect to a listed phone
+      devices                        - List CoreAudio devices
+      setdevice <idx>                - Select a full-duplex call audio device
+      call <number> --config <file>  - Dial using caller details from a JSON file
+      hangup                         - End the current call
+      status                         - Show connection and call status
+      verbose <on|off>               - Show every HFP event in the terminal
+      disconnect                     - Disconnect the phone
+      help                           - Show this help
+      quit                           - Exit PhoneBT
     """)
 }
 
-// MARK: - Global State
-
-/// CoreAudio device carrying phone-call audio. Defaults to the USB audio adapter
-/// wired to the phone; override with PHONEBT_AUDIO_DEVICE (name substring match).
-let callAudioDeviceName = ProcessInfo.processInfo.environment["PHONEBT_AUDIO_DEVICE"] ?? "USB Advanced Audio Device"
-
-let bluetoothManager = BluetoothManager()
-let audioRouter = AudioRouter(preferredDeviceName: callAudioDeviceName)
-var hfpDevice: HFPDevice?
-var claudeAgent: ClaudeAgent?
-var eventListenerTask: Task<Void, Never>?
-var discoveredDevices: [DiscoveredDevice] = []
-var isRunning = true
-
-// Audio pipeline globals
-var audioSessionManager: AudioSessionManager?
-var audioCapture: AudioCapture?
-var ttsPlayer: TTSPlayer?
-var scoConnectTask: Task<Void, Never>?
-var activeAudioDevice: AudioDeviceInfo?
-
-// TTS configuration
-var ttsVoiceID = "21m00Tcm4TlvDq8ikWAM"
-var ttsModelID = "eleven_turbo_v2"
-
-// LLM configuration
-var currentModelName = ProcessInfo.processInfo.environment["PHONEBT_MODEL"] ?? "claude-sonnet-4-6"
-var currentLLMService: (any LLMService)?
-
-func makeLLMService(modelName: String) -> (any LLMService)? {
-    if modelName.hasPrefix("gpt-") || modelName.hasPrefix("o1") || modelName.hasPrefix("o3") || modelName.hasPrefix("o4") {
-        guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
-            print("OPENAI_API_KEY environment variable not set.")
-            return nil
-        }
-        return OpenAILLMService(apiKey: apiKey, model: modelName)
-    } else {
-        guard let apiKey = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] else {
-            print("ANTHROPIC_API_KEY environment variable not set.")
-            return nil
-        }
-        return AnthropicLLMService(apiKey: apiKey, model: modelName)
-    }
+func cleanupCall() {
+    audioStartTask?.cancel()
+    audioStartTask = nil
+    realtimeSession?.close()
+    realtimeSession = nil
+    audioSessionManager?.stop()
+    audioSessionManager = nil
+    activeAudioDevice = nil
+    audioRouter.restorePreviousRouting()
 }
 
-// MARK: - Signal Handling
+func shutdown() {
+    isRunning = false
+    cleanupCall()
+    hfpDevice?.disconnect()
+}
 
 signal(SIGINT) { _ in
     print("\nShutting down...")
-    isRunning = false
-    stopAudioPipeline()
-    hfpDevice?.disconnect()
-    audioRouter.restorePreviousRouting()
+    shutdown()
     exit(0)
 }
 
 signal(SIGTERM) { _ in
-    stopAudioPipeline()
-    hfpDevice?.disconnect()
-    audioRouter.restorePreviousRouting()
+    shutdown()
     exit(0)
 }
 
-// MARK: - Command Handlers
-
-func handleScan() async {
-    print("Scanning for Bluetooth devices (10 seconds)...")
-    do {
-        discoveredDevices = try await bluetoothManager.scanForDevices(duration: 10)
-        if discoveredDevices.isEmpty {
-            print("No devices found. Try 'paired' to see already-paired devices.")
-        } else {
-            printDeviceList(discoveredDevices)
-        }
-    } catch {
-        print("Scan error: \(error.localizedDescription)")
+func printDeviceList(_ devices: [DiscoveredDevice]) {
+    guard !devices.isEmpty else {
+        print("No devices found.")
+        return
+    }
+    for (index, device) in devices.enumerated() {
+        let hfp = device.isHandsFreeGateway ? " [HFP]" : ""
+        print("  [\(index)] \(device.name) (\(device.address))\(hfp)")
     }
 }
 
 func handlePaired() {
     discoveredDevices = bluetoothManager.getPairedPhones()
-    if discoveredDevices.isEmpty {
-        print("No paired devices found.")
-    } else {
+    printDeviceList(discoveredDevices)
+}
+
+func handleScan() async {
+    print("Scanning for Bluetooth devices (10 seconds)...")
+    do {
+        discoveredDevices = try await bluetoothManager.scanForDevices(duration: 10)
         printDeviceList(discoveredDevices)
+    } catch {
+        print("Scan failed: \(error.localizedDescription)")
     }
 }
 
-func printDeviceList(_ devices: [DiscoveredDevice]) {
-    print("\nFound \(devices.count) device(s):")
-    for (i, device) in devices.enumerated() {
-        let hfp = device.isHandsFreeGateway ? " [HFP]" : ""
-        print("  [\(i)] \(device.name) (\(device.address))\(hfp)")
-    }
-    print()
-}
-
-func handleConnect(indexStr: String) async {
-    guard let index = Int(indexStr), index >= 0, index < discoveredDevices.count else {
-        print("Invalid device index. Run 'scan' or 'paired' first.")
+func handleConnect(indexText: String) async {
+    guard let index = Int(indexText), discoveredDevices.indices.contains(index) else {
+        print("Invalid device index. Run 'paired' or 'scan' first.")
         return
     }
-
     let selected = discoveredDevices[index]
-    guard let btDevice = bluetoothManager.device(forAddress: selected.address) else {
-        print("Could not find device with address \(selected.address)")
+    guard let bluetoothDevice = bluetoothManager.device(forAddress: selected.address),
+          let device = HFPDevice(bluetoothDevice: bluetoothDevice) else {
+        print("Could not create an HFP connection for \(selected.name).")
         return
     }
-
-    guard let device = HFPDevice(bluetoothDevice: btDevice) else {
-        print("Failed to create HFP device for \(selected.name)")
-        return
-    }
-    hfpDevice = device
 
     print("Connecting to \(selected.name)...")
     do {
         try await device.connect()
-        print("Connected to \(selected.name)")
-
-        // Start event monitoring
+        hfpDevice = device
         let stream = device.eventStream.makeStream()
         Task {
-            for await event in stream {
-                handleEvent(event)
-            }
+            for await event in stream { handleEvent(event) }
         }
+        print("Connected to \(selected.name).")
     } catch {
         print("Connection failed: \(error.localizedDescription)")
-        hfpDevice = nil
     }
-}
-
-// MARK: - Audio Pipeline
-
-var isAudioPipelineRunning: Bool {
-    return audioSessionManager != nil
-}
-
-func startAudioPipeline() -> Bool {
-    guard let device = hfpDevice else {
-        logger.error("HFP Device is not available")
-        return false
-    }
-
-    guard !isAudioPipelineRunning else {
-        logger.info("Audio pipeline already running")
-        return true
-    }
-
-    guard let audioDevice = audioRouter.callAudioDevice() else {
-        logger.error("No call audio device found for audio pipeline (preferred: \(callAudioDeviceName))")
-        return false
-    }
-
-    let session = AudioSessionManager()
-    do {
-        try session.configure(deviceID: audioDevice.id)
-        try session.start()
-    } catch {
-        logger.error("Failed to start audio session: \(error)")
-        return false
-    }
-    audioSessionManager = session
-    activeAudioDevice = audioDevice
-
-    // Set up STT capture
-    let capture = AudioCapture(sessionManager: session)
-    capture.onTranscription = { text in
-        device.eventStream.emit(.callerSpeech(text))
-    }
-    do {
-        try capture.start()
-    } catch {
-        logger.error("Failed to start audio capture: \(error)")
-    }
-    audioCapture = capture
-
-    // Set up TTS player if ElevenLabs key is available
-    if let elevenLabsKey = ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"] {
-        ttsPlayer = TTSPlayer(sessionManager: session, apiKey: elevenLabsKey, voiceID: ttsVoiceID, modelID: ttsModelID)
-        logger.info("TTS player initialized with ElevenLabs (voice: \(ttsVoiceID), model: \(ttsModelID))")
-    } else {
-        logger.info("ELEVENLABS_API_KEY not set — TTS disabled")
-    }
-
-    logger.info("Audio pipeline started for device: \(audioDevice.name)")
-    return true
-}
-
-/// Route system audio to the call audio device and start the pipeline.
-/// The device is usually present immediately (USB adapter), but a Bluetooth SCO
-/// fallback device is published asynchronously — so poll briefly before giving up.
-func startAudioWhenDeviceAppears(attempts: Int = 20, delay: Duration = .milliseconds(500)) async {
-    guard !isAudioPipelineRunning else { return }
-
-    for _ in 1...attempts {
-        if Task.isCancelled { return }
-
-        if let audioDevice = audioRouter.callAudioDevice() {
-            print("🎧 Call audio device: \(audioDevice.name) [\(audioDevice.transportTypeDescription)]")
-            if audioRouter.routeToCallAudioDevice() {
-                print("Audio Routing Started")
-            } else {
-                print("⚠️  Failed to route system audio to \(audioDevice.name)")
-            }
-            if startAudioPipeline() {
-                print("Audio Pipeline Started")
-            } else {
-                print("⚠️  Audio pipeline failed to start — check the com.phonebt log")
-            }
-            return
-        }
-
-        try? await Task.sleep(for: delay)
-    }
-
-    print("\n⚠️  Call audio device \"\(callAudioDeviceName)\" not found — audio pipeline not started")
-    let devices = AudioDeviceManager().getAllDevices()
-    logger.error("CoreAudio devices visible (\(devices.count)):")
-    for device in devices {
-        logger.error("  \(device.name) [transport=\(device.transportTypeDescription), in=\(device.hasInput), out=\(device.hasOutput)]")
-    }
-}
-
-func stopAudioPipeline() {
-    audioCapture?.stop()
-    audioCapture = nil
-    audioSessionManager?.stop()
-    audioSessionManager = nil
-    ttsPlayer = nil
-    activeAudioDevice = nil
-    logger.info("Audio pipeline stopped")
-}
-
-/// Start call audio (routing + pipeline) in the background, once.
-/// Safe to call from several events (`.callActive`, `.scoConnected`) — a
-/// pending or completed start is not repeated.
-func startCallAudio() {
-    guard !isAudioPipelineRunning else { return }
-    if let task = scoConnectTask, !task.isCancelled { return }  // attempt already in progress
-
-    // Run on the main actor so overlapping events can't start two pipelines.
-    scoConnectTask = Task { @MainActor in
-        await startAudioWhenDeviceAppears()
-        if !Task.isCancelled { scoConnectTask = nil }
-    }
-}
-
-func handleEvent(_ event: HFPEvent) {
-    switch event {
-    case .incomingCall(let number):
-        print("\n📞 Incoming call from \(number ?? "unknown")")
-        print("Type 'answer' to accept or 'hangup' to reject")
-    case .callEnded:
-        print("\n📱 Call ended")
-        scoConnectTask?.cancel()
-        scoConnectTask = nil
-        stopAudioPipeline()
-        audioRouter.restorePreviousRouting()
-    case .callActive:
-        print("\n📱 Call active")
-        // With a wired USB audio adapter the call audio is available as soon as
-        // the call is active, independent of the Mac's own SCO link.
-        startCallAudio()
-    case .scoConnected:
-        print("\n🔊 Audio connected")
-        startCallAudio()
-    case .scoDisconnected:
-        print("\n🔇 Audio disconnected")
-        if let active = activeAudioDevice, !active.isBluetooth,
-           hfpDevice?.currentState.call == .active {
-            // Call audio is on a wired device; the Mac's SCO link dropping doesn't affect it.
-            print("Call still active on \(active.name) — keeping audio pipeline running")
-        } else {
-            scoConnectTask?.cancel()
-            scoConnectTask = nil
-            stopAudioPipeline()
-            audioRouter.restorePreviousRouting()
-        }
-    case .callerSpeech(let text):
-        print("\n🗣️  Caller: \"\(text)\"")
-    case .disconnected:
-        print("\n⚠️  Device disconnected")
-        scoConnectTask?.cancel()
-        scoConnectTask = nil
-        stopAudioPipeline()
-        hfpDevice = nil
-    default:
-        break
-    }
-}
-
-func preCallCheck() -> Bool {
-    guard let device = hfpDevice, device.currentState.connection == .connected else {
-        print("Phone not connected via Bluetooth. Use 'connect' first.")
-        return false
-    }
-    guard audioRouter.callAudioDevice() != nil else {
-        print("No audio device selected or available. Use 'devices' and 'setdevice' to pick one.")
-        return false
-    }
-    return true
-}
-
-func handleDial(number: String) {
-    guard preCallCheck() else { return }
-    do {
-        try hfpDevice!.dial(number: number)
-        print("Dialing \(number)...")
-        try? hfpDevice!.transferAudioToComputer()
-    } catch {
-        print("Dial failed: \(error.localizedDescription)")
-    }
-}
-
-func handleAnswer() {
-    guard let device = hfpDevice else {
-        print("Not connected.")
-        return
-    }
-    do {
-        try device.acceptCall()
-        try? device.transferAudioToComputer()
-        _ = audioRouter.routeToCallAudioDevice()
-        print("Call answered")
-    } catch {
-        print("Answer failed: \(error.localizedDescription)")
-    }
-}
-
-func handleHangup() {
-    guard let device = hfpDevice else {
-        print("Not connected.")
-        return
-    }
-    do {
-        try device.endCall()
-        audioRouter.restorePreviousRouting()
-        print("Call ended")
-    } catch {
-        print("Hangup failed: \(error.localizedDescription)")
-    }
-}
-
-func handleDTMF(digit: String) {
-    guard let device = hfpDevice else {
-        print("Not connected.")
-        return
-    }
-    do {
-        try device.sendDTMF(digit)
-    } catch {
-        print("DTMF failed: \(error.localizedDescription)")
-    }
-}
-
-func handleStatus() {
-    guard let device = hfpDevice else {
-        print("Not connected.")
-        return
-    }
-    let state = device.currentState
-    print("Connection: \(state.connection.rawValue)")
-    print("Call: \(state.call.rawValue)")
-    print("Audio: \(state.audio.rawValue)")
-    if let call = state.activeCall {
-        print("  Direction: \(call.direction.rawValue)")
-        print("  Number: \(call.number ?? "unknown")")
-        if let duration = call.durationDescription {
-            print("  Duration: \(duration)")
-        }
-    }
-}
-
-func handlePhoneStatus() {
-    guard let device = hfpDevice else {
-        print("Not connected.")
-        return
-    }
-    let phone = device.currentState.phoneStatus
-    print("Signal: \(phone.signalStrength)/5")
-    print("Battery: \(phone.batteryLevel)/5")
-    print("Service: \(phone.serviceAvailable ? "available" : "unavailable")")
-    print("Operator: \(phone.operatorName ?? "unknown")")
-    print("Roaming: \(phone.roaming ? "yes" : "no")")
 }
 
 func handleAudioDevices() {
     let devices = audioRouter.allDevices()
     let selected = audioRouter.callAudioDevice()
-    if devices.isEmpty {
+    guard !devices.isEmpty else {
         print("No audio devices found.")
         return
     }
-    print("Audio devices (selected marked with *):")
-    for (i, device) in devices.enumerated() {
+    for (index, device) in devices.enumerated() {
         let marker = device.id == selected?.id ? "*" : " "
-        let io = device.hasInput && device.hasOutput ? "in/out" :
-                 device.hasInput ? "in" :
-                 device.hasOutput ? "out" : "-"
-        print("  [\(i)] \(marker) \(device.name) [\(device.transportTypeDescription), \(io)]")
-    }
-    if selected == nil {
-        print("\nNo call audio device selected. Use 'setdevice <idx>' to select one.")
+        let io = device.hasInput && device.hasOutput ? "in/out" : device.hasInput ? "in" : device.hasOutput ? "out" : "-"
+        print("  [\(index)] \(marker) \(device.name) [\(device.transportTypeDescription), \(io)]")
     }
 }
 
-func handleSetDevice(indexStr: String) {
+func handleSetDevice(indexText: String) {
     let devices = audioRouter.allDevices()
-    guard let index = Int(indexStr), index >= 0, index < devices.count else {
-        print("Invalid index. Run 'devices' to see available devices.")
+    guard let index = Int(indexText), devices.indices.contains(index) else {
+        print("Invalid audio device index. Run 'devices' first.")
         return
     }
     let device = devices[index]
     guard device.hasInput && device.hasOutput else {
-        print("Device '\(device.name)' does not support both input and output. Pick a full-duplex device.")
+        print("Select a device that supports both input and output.")
         return
     }
     audioRouter.setPreferredDeviceName(device.name)
-    print("Audio device set to: \(device.name)")
+    print("Call audio device set to \(device.name).")
 }
 
-func handleSet(argument: String) {
-    let parts = argument.split(separator: " ", maxSplits: 1).map(String.init)
-    guard parts.count == 2 else {
-        print("Usage: set <key> <value>")
-        print("Keys: tts.voice, tts.model")
+func parseCallArguments(_ argument: String) -> (number: String, configURL: URL)? {
+    let separator = " --config "
+    guard let range = argument.range(of: separator) else { return nil }
+    let number = argument[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+    var path = argument[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+    if path.count >= 2, path.first == "\"", path.last == "\"" {
+        path.removeFirst()
+        path.removeLast()
+    }
+    guard !number.isEmpty, !path.isEmpty else { return nil }
+    let expandedPath = NSString(string: path).expandingTildeInPath
+    return (number, URL(fileURLWithPath: expandedPath))
+}
+
+func handleCall(argument: String) {
+    guard let device = hfpDevice, device.currentState.connection == .connected else {
+        print("Connect a phone first.")
         return
     }
-    let key = parts[0].lowercased()
-    let value = parts[1]
+    guard audioRouter.callAudioDevice() != nil else {
+        print("Select a call audio device with 'devices' and 'setdevice <idx>'.")
+        return
+    }
+    guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
+        print("OPENAI_API_KEY is not set.")
+        return
+    }
+    guard let call = parseCallArguments(argument) else {
+        print("Usage: call <number> --config /path/to/call.json")
+        return
+    }
+    guard device.currentState.call == .idle else {
+        print("A call is already in progress.")
+        return
+    }
 
-    switch key {
-    case "tts.voice":
-        ttsVoiceID = value
-        if let player = ttsPlayer as? TTSPlayer {
-            player.setVoiceID(value)
+    let configuration: CallConfiguration
+    do {
+        let data = try Data(contentsOf: call.configURL)
+        configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+    } catch {
+        print("Could not load call configuration: \(error.localizedDescription)")
+        return
+    }
+
+    let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+    let resultName = "\(call.configURL.deletingPathExtension().lastPathComponent)-\(timestamp)-appointment-result.json"
+    let resultURL = call.configURL.deletingLastPathComponent().appendingPathComponent(resultName)
+    let session = RealtimeCallSession(
+        apiKey: apiKey,
+        configuration: configuration,
+        resultURL: resultURL,
+        device: device
+    ) { message in
+        print("\n[Realtime] \(message)")
+        print("phonebt> ", terminator: "")
+        fflush(stdout)
+    }
+    realtimeSession = session
+    session.prepare()
+
+    do {
+        try device.dial(number: call.number)
+        try? device.transferAudioToComputer()
+        print("Dialing \(call.number)… Realtime session is preparing.")
+    } catch {
+        session.close()
+        realtimeSession = nil
+        print("Dial failed: \(error.localizedDescription)")
+    }
+}
+
+func startCallAudioWhenAvailable(attempts: Int = 20) async {
+    guard audioSessionManager == nil, let realtimeSession else { return }
+
+    for _ in 0..<attempts {
+        if Task.isCancelled { return }
+        if let audioDevice = audioRouter.callAudioDevice() {
+            _ = audioRouter.routeToCallAudioDevice()
+            let manager = AudioSessionManager()
+            do {
+                try manager.configure(deviceID: audioDevice.id)
+                try manager.start()
+                try realtimeSession.startAudio(using: manager)
+                audioSessionManager = manager
+                activeAudioDevice = audioDevice
+                print("Realtime audio started on \(audioDevice.name).")
+            } catch {
+                manager.stop()
+                print("Could not start Realtime audio: \(error.localizedDescription)")
+            }
+            return
         }
-        print("TTS voice ID set to: \(value)")
-    case "tts.model":
-        ttsModelID = value
-        if let player = ttsPlayer as? TTSPlayer {
-            player.setModelID(value)
-        }
-        print("TTS model set to: \(value)")
+        try? await Task.sleep(for: .milliseconds(500))
+    }
+    print("Call audio device did not become available.")
+}
+
+func startCallAudio() {
+    guard audioSessionManager == nil, audioStartTask == nil else { return }
+    audioStartTask = Task { @MainActor in
+        await startCallAudioWhenAvailable()
+        audioStartTask = nil
+    }
+}
+
+func handleEvent(_ event: HFPEvent) {
+    if verboseLogging {
+        print("\n[HFP] \(String(describing: event))")
+    }
+    switch event {
+    case .callActive:
+        print("\nCall active.")
+        startCallAudio()
+    case .scoConnected:
+        if hfpDevice?.currentState.call == .active { startCallAudio() }
+    case .callEnded:
+        print("\nCall ended.")
+        cleanupCall()
+    case .scoDisconnected:
+        if activeAudioDevice?.isBluetooth == true { cleanupCall() }
+    case .disconnected:
+        print("\nPhone disconnected.")
+        cleanupCall()
+        hfpDevice = nil
+    case .incomingCall:
+        print("\nIncoming calls are not handled by the Realtime agent in this version.")
     default:
-        print("Unknown key: \(key). Available: tts.voice, tts.model")
+        break
     }
 }
 
-func handleModel(argument: String) {
-    guard !argument.isEmpty else {
-        print("Current model: \(currentModelName)")
-        print("Usage: model <name>")
-        print("Examples: model claude-sonnet-4-6, model gpt-4o, model claude-haiku-4-5-20251001")
+func handleVerbose(argument: String) {
+    switch argument.lowercased() {
+    case "on", "1", "true":
+        verboseLogging = true
+        print("Verbose HFP logging enabled.")
+    case "off", "0", "false":
+        verboseLogging = false
+        print("Verbose HFP logging disabled.")
+    default:
+        print("Verbose HFP logging is \(verboseLogging ? "on" : "off"). Usage: verbose <on|off>")
+    }
+}
+
+func handleHangup() {
+    guard let device = hfpDevice else {
+        print("No phone connected.")
         return
     }
-    guard let service = makeLLMService(modelName: argument) else { return }
-    currentLLMService = service
-    currentModelName = argument
-    print("Model set to: \(argument)")
+    do {
+        try device.endCall()
+    } catch {
+        print("Hangup failed: \(error.localizedDescription)")
+    }
 }
 
-func handleAgentMode() async {
-    guard preCallCheck() else { return }
-    let device = hfpDevice!
-
-    let llmService: any LLMService
-    if let existing = currentLLMService {
-        llmService = existing
-    } else if let created = makeLLMService(modelName: currentModelName) {
-        currentLLMService = created
-        llmService = created
-    } else {
+func handleStatus() {
+    guard let device = hfpDevice else {
+        print("Connection: disconnected")
         return
     }
-
-    let executor = ToolExecutor(device: device, audioRouter: audioRouter, ttsPlayer: ttsPlayer)
-    let agent = ClaudeAgent(llmService: llmService, toolExecutor: executor, eventStream: device.eventStream)
-    claudeAgent = agent
-
-    // Start event listener
-    eventListenerTask = agent.startEventListener { response in
-        print("\nAgent: \(response)")
-        print("agent> ", terminator: "")
-        fflush(stdout)
-    }
-
-    print("\nAI Agent Mode (model: \(currentModelName)) — type natural language commands")
-    print("Type 'exit' to return to manual mode\n")
-
-    while isRunning {
-        print("agent> ", terminator: "")
-        fflush(stdout)
-
-        guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !line.isEmpty else {
-            continue
-        }
-
-        if line.lowercased() == "exit" {
-            eventListenerTask?.cancel()
-            eventListenerTask = nil
-            claudeAgent = nil
-            print("Exiting agent mode.")
-            break
-        }
-
-        do {
-            let response = try await agent.processMessage(line)
-            print("Agent: \(response)")
-        } catch {
-            print("Agent error: \(error.localizedDescription)")
-        }
+    let state = device.currentState
+    print("Connection: \(state.connection.rawValue)")
+    print("Call: \(state.call.rawValue)")
+    print("HFP audio: \(state.audio.rawValue)")
+    print("Realtime: \(realtimeSession == nil ? "inactive" : "prepared")")
+    if let call = state.activeCall {
+        print("Number: \(call.number ?? "unknown")")
+        if let duration = call.durationDescription { print("Duration: \(duration)") }
     }
 }
-
-// MARK: - Main Loop
 
 printBanner()
 printHelp()
 
-// Request speech recognition authorization early
-AudioCapture.requestAuthorization { authorized in
-    if authorized {
-        logger.info("Speech recognition authorized")
-    } else {
-        logger.info("Speech recognition not authorized — caller transcription will be unavailable")
-    }
-}
-
-// Run the main loop
 let mainTask = Task {
     while isRunning {
         print("phonebt> ", terminator: "")
         fflush(stdout)
-
-        guard let line = readLine() else {
-            // EOF — stdin closed (e.g., piped input exhausted)
-            break
-        }
-
+        guard let line = readLine() else { break }
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { continue }
-
         let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
         let command = parts[0].lowercased()
         let argument = parts.count > 1 ? parts[1] : ""
 
         switch command {
-        case "scan":
-            await handleScan()
-        case "paired":
-            handlePaired()
-        case "connect":
-            await handleConnect(indexStr: argument)
+        case "paired": handlePaired()
+        case "scan": await handleScan()
+        case "connect": await handleConnect(indexText: argument)
+        case "devices", "audio": handleAudioDevices()
+        case "setdevice": handleSetDevice(indexText: argument)
+        case "call", "dial": handleCall(argument: argument)
+        case "hangup", "end": handleHangup()
+        case "status": handleStatus()
+        case "verbose": handleVerbose(argument: argument)
         case "disconnect":
+            cleanupCall()
             hfpDevice?.disconnect()
             hfpDevice = nil
-            print("Disconnected.")
-        case "dial", "call":
-            handleDial(number: argument)
-        case "answer", "accept":
-            handleAnswer()
-        case "hangup", "end":
-            handleHangup()
-        case "dtmf":
-            handleDTMF(digit: argument)
-        case "status":
-            handleStatus()
-        case "phone":
-            handlePhoneStatus()
-        case "devices", "audio":
-            handleAudioDevices()
-        case "setdevice":
-            handleSetDevice(indexStr: argument)
-        case "set":
-            handleSet(argument: argument)
-        case "model":
-            handleModel(argument: argument)
-        case "agent", "ai":
-            await handleAgentMode()
-        case "help":
-            printHelp()
+        case "help": printHelp()
         case "quit", "exit", "q":
             print("Goodbye!")
-            isRunning = false
-            hfpDevice?.disconnect()
-            audioRouter.restorePreviousRouting()
+            shutdown()
             exit(0)
         default:
-            print("Unknown command: \(command). Type 'help' for available commands.")
+            print("Unknown command. Type 'help'.")
         }
     }
 }
 
-// Keep the run loop alive for Bluetooth callbacks
 RunLoop.main.run()

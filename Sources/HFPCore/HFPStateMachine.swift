@@ -192,9 +192,6 @@ public final class HFPStateMachine: @unchecked Sendable {
         case .operatorName(let name):
             state.phoneStatus.operatorName = name
 
-        case .callerSpeech:
-            break // handled by ClaudeAgent directly
-
         case .error:
             break
         }

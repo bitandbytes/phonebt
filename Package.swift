@@ -22,9 +22,7 @@ let package = Package(
     products: [
         .executable(name: "PhoneBT", targets: ["PhoneBT"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic.git", from: "2.2.0"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "Shared",
@@ -44,7 +42,6 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
-                .linkedFramework("Speech"),
             ]
         ),
         .target(
@@ -53,7 +50,6 @@ let package = Package(
                 "HFPCore",
                 "AudioPipeline",
                 "Shared",
-                .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
             ]
         ),
         .executableTarget(
@@ -68,9 +64,13 @@ let package = Package(
         .testTarget(
             name: "HFPCoreTests",
             dependencies: ["HFPCore"]
+
         ),
+
         .testTarget(
+
             name: "AgentBridgeTests",
+
             dependencies: ["AgentBridge"]
         ),
     ]
