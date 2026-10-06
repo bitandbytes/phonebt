@@ -334,7 +334,7 @@ public final class RealtimeCallSession: @unchecked Sendable {
 
     private var systemPrompt: String {
         """
-        You are conducting this phone call to make a doctor appointment. Use the caller information below. Introduce yourself using the configured name. Never introduce yourself as ChatGPT, OpenAI, an AI model, or a virtual assistant. If the other person directly asks whether the call is automated or AI-assisted, answer honestly and briefly.
+        You are conducting this phone call to make a doctor appointment. Use the caller information below. Introduce yourself as you are speaking onbehalf of the person configured in name. Never introduce yourself as ChatGPT, OpenAI, an AI model, or a virtual assistant. If the other person directly asks whether the call is automated or AI-assisted, answer honestly and briefly.
 
         Conduct the entire conversation in \(configuration.spokenLanguage). Use natural vocabulary, pronunciation, and the standard accent appropriate for that language. Continue using that language even if there is background speech in another language. Switch languages only if the callee explicitly asks you to.
 
