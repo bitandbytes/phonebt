@@ -167,7 +167,7 @@ public final class HFPStateMachine: @unchecked Sendable {
                 if state.activeCall?.startTime == nil {
                     state.activeCall?.startTime = Date()
                 }
-            } else if !active {
+            } else if !active && (state.call == .active || state.call == .held) {
                 state.call = .idle
                 state.activeCall = nil
             }

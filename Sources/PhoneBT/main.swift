@@ -229,12 +229,11 @@ func handleCall(argument: String) {
         fflush(stdout)
     }
     callSession = session
-    session.prepare()
 
     do {
         try device.dial(number: call.number)
         try? device.transferAudioToComputer()
-        print("Dialing \(call.number)… GPT-Live session is preparing.")
+        print("Dialing \(call.number)… GPT-Live will start when the call is answered.")
     } catch {
         session.close(finalizeOutcome: false)
         callSession = nil
@@ -283,9 +282,13 @@ func handleEvent(_ event: HFPEvent) {
     switch event {
     case .callActive:
         print("\nCall active.")
+        callSession?.prepare()
         startCallAudio()
     case .scoConnected:
-        if hfpDevice?.currentState.call == .active { startCallAudio() }
+        if hfpDevice?.currentState.call == .active {
+            callSession?.prepare()
+            startCallAudio()
+        }
     case .callEnded:
         print("\nCall ended.")
         cleanupCall()

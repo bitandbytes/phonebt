@@ -59,6 +59,28 @@ import Testing
     #expect(event["audio"] as? String == "AQIDBA==")
 }
 
+@Test func replacementLiveSessionIncludesPriorTranscriptHistory() throws {
+    let event = LiveProtocol.sessionStart(
+        voice: "marin",
+        liveInstructions: "Live instructions",
+        backendInstructions: "Backend instructions",
+        callerContext: "Trusted caller facts",
+        history: [
+            LiveHistoryMessage(role: "user", text: "Tuesday would work."),
+            LiveHistoryMessage(role: "assistant", text: "What time is available?"),
+        ]
+    )
+
+    let session = try #require(event["session"] as? [String: Any])
+    let input = try #require(session["input"] as? [[String: Any]])
+    #expect(input.count == 3)
+    #expect(input[1]["role"] as? String == "user")
+    #expect(input[2]["role"] as? String == "assistant")
+    let assistantContent = try #require(input[2]["content"] as? [[String: Any]])
+    #expect(assistantContent.first?["type"] as? String == "output_text")
+    #expect(assistantContent.first?["text"] as? String == "What time is available?")
+}
+
 @Test func delegatedFunctionCallIsParsedFromNestedResponseEvent() throws {
     let envelope: [String: Any] = [
         "type": "response.event",
@@ -109,6 +131,27 @@ import Testing
     #expect(item["role"] as? String == "user")
     let content = try #require(item["content"] as? [[String: Any]])
     #expect(content.first?["text"] as? String == "Finalize the call result")
+}
+
+@Test func liveEventsMapToTerminalActivityStatuses() {
+    #expect(
+        LiveProtocol.activity(for: "session.input_transcript.delta", event: [:]) ==
+            .calleeSpeaking
+    )
+    #expect(
+        LiveProtocol.activity(for: "session.output_transcript.delta", event: [:]) ==
+            .assistantSpeaking
+    )
+    #expect(
+        LiveProtocol.activity(for: "session.delegation.created", event: [:]) ==
+            .waitingForAssistant
+    )
+    #expect(LiveProtocol.activity(for: "response.event", event: [
+        "event": ["type": "response.created"],
+    ]) == .assistantWorking)
+    #expect(LiveProtocol.activity(for: "response.event", event: [
+        "event": ["type": "response.completed"],
+    ]) == .discussionOngoing)
 }
 
 @Test func dtmfValidationAcceptsOnlyOneTelephoneKey() {

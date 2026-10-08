@@ -33,13 +33,21 @@ Typical flow. First create a call configuration, for example `appointment.json`:
   "insurance": "Example Health, member 123456",
   "additionalDetails": "Request a routine appointment, preferably in the morning.",
   "gender": "male",
-  "language": "German"
+  "language": "German",
+  "telephoneNumber": "+491234567890",
+  "doctorReferralDetails": {
+    "Überweisung": "Radiologie",
+    "Diagnose/Verdachtsdiagnose": "Mastodynie links",
+    "Auftrag": "Erbitte MammaSono bds., ggf. Mammographie"
+  }
 }
 ```
 
 `gender` controls the GPT-Live output voice: `male` selects `cedar`, while `female` selects `marin`. The field is optional and defaults to `female`/`marin` for compatibility with existing configuration files. This is a PhoneBT voice-selection convention; OpenAI identifies these as named voices rather than assigning official genders to them.
 
 `language` controls the language used throughout the conversation, for example `"English"`, `"German"`, or `"French"`. It is optional and defaults to English. PhoneBT applies it through the GPT-Live instructions because native speech-to-speech sessions do not have a separate output-language setting.
+
+`telephoneNumber` and `doctorReferralDetails` are optional. Referral details are passed as string key-value pairs so German medical labels, document identifiers, and wording can be preserved verbatim. The assistant provides those facts only when relevant or requested.
 
 Then start the call:
 
@@ -52,7 +60,7 @@ phonebt> verbose on
 phonebt> call +15551234567 --config /path/to/appointment.json
 ```
 
-The GPT-Live session is prepared while the phone is dialing. Audio capture and playback begin only after the HFP call-active callback. `hangup` remains available as a terminal safety override. When the call ends, PhoneBT writes a timestamped `*-appointment-result.json` beside the input configuration.
+The GPT-Live session and call-audio capture start only after the HFP call-active callback, so a long ringing interval does not consume the Live session lifetime. Up to five seconds of initial call audio are buffered while the session starts and then delivered in order, preserving the callee's greeting. If the Live session expires or its transport fails while the telephone call remains active, PhoneBT makes up to three reconnection attempts and supplies the retained conversation transcript to the replacement session. Transcript text is retained only in memory for this recovery and is not printed. `hangup` remains available as a terminal safety override. When the call ends, PhoneBT writes a timestamped `*-appointment-result.json` beside the input configuration.
 
 A booked appointment result has this format:
 
@@ -73,7 +81,7 @@ The automatically created PCM files can be imported into Audacity or played usin
 ffplay -f s16le -ar 24000 -ac 1 /path/to/config/<file>-agent-input.pcm
 ```
 
-GPT-Live connection and API events are printed in the terminal. `verbose on` additionally prints every HFP callback event. To inspect the complete macOS unified logs in another terminal, run:
+GPT-Live activity is printed in the terminal as privacy-preserving status changes such as callee speaking, assistant speaking, waiting for the call assistant, and recovering the final result. Transcript text is not printed. While a call remains active, a 60-second heartbeat repeats the current status and elapsed time. `verbose on` additionally prints every HFP callback event. To inspect the complete macOS unified logs in another terminal, run:
 
 ```bash
 log stream --level debug --predicate 'subsystem == "com.phonebt"'

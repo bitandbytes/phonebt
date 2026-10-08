@@ -43,3 +43,25 @@ import Testing
     #expect(configuration.liveVoice == "marin")
     #expect(configuration.spokenLanguage == "English")
 }
+
+@Test func doctorReferralDetailsSurviveDecodingAndEncoding() throws {
+    let data = Data(#"{"name":"Hasini Jayathilaka","dateOfBirth":"1993-09-01","insurance":"TK","additionalDetails":"Mammography appointment","telephoneNumber":"+491772635867","doctorReferralDetails":{"Überweisung":"Radiologie","Diagnose/Verdachtsdiagnose":"Mastodynie links, Beschwerden zunehmen","Auftrag":"Erbitte MammaSono bds., ggf. Mammographie"}}"#.utf8)
+    let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+
+    #expect(configuration.telephoneNumber == "+491772635867")
+    #expect(configuration.doctorReferralDetails?["Überweisung"] == "Radiologie")
+    #expect(
+        configuration.doctorReferralDetails?["Diagnose/Verdachtsdiagnose"] ==
+            "Mastodynie links, Beschwerden zunehmen"
+    )
+
+    let encoded = try JSONEncoder().encode(configuration)
+    let encodedObject = try #require(
+        JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+    )
+    let encodedReferral = try #require(
+        encodedObject["doctorReferralDetails"] as? [String: String]
+    )
+    #expect(encodedObject["telephoneNumber"] as? String == "+491772635867")
+    #expect(encodedReferral["Auftrag"] == "Erbitte MammaSono bds., ggf. Mammographie")
+}

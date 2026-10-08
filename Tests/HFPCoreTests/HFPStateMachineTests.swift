@@ -169,6 +169,27 @@ final class HFPStateMachineTests: XCTestCase {
         XCTAssertNil(stateMachine.currentState.activeCall)
     }
 
+    func testInactiveCallIndicatorDoesNotCancelOutgoingSetup() {
+        stateMachine.handleEvent(.callDialing(number: "+15551234567"))
+        stateMachine.handleEvent(.callAlerting)
+        stateMachine.handleEvent(.callIndicator(false))
+
+        XCTAssertEqual(stateMachine.currentState.call, .alerting)
+        XCTAssertNotNil(stateMachine.currentState.activeCall)
+    }
+
+    func testUnansweredCallEndedEventClearsAlertingState() {
+        stateMachine.handleEvent(.callDialing(number: "+15551234567"))
+        stateMachine.handleEvent(.callAlerting)
+        stateMachine.handleEvent(.callSetup(0))
+        XCTAssertEqual(stateMachine.currentState.call, .alerting)
+
+        stateMachine.handleEvent(.callEnded)
+
+        XCTAssertEqual(stateMachine.currentState.call, .idle)
+        XCTAssertNil(stateMachine.currentState.activeCall)
+    }
+
     // MARK: - Call Held Indicator
 
     func testCallHeldIndicator() {

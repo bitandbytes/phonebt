@@ -78,7 +78,6 @@ public final class HFPDevice: @unchecked Sendable {
 
         // Wait for connection event with timeout
         let stream = eventStream.makeStream()
-        let deadline = Date().addingTimeInterval(timeout)
 
         // Use a task group to race the event stream against a timeout
         try await withThrowingTaskGroup(of: Void.self) { group in

@@ -23,9 +23,26 @@ struct LiveFunctionCall {
     let arguments: [String: Any]
 }
 
+struct LiveHistoryMessage {
+    let role: String
+    let text: String
+}
+
 struct AudioDumpPaths {
     let inputURL: URL
     let outputURL: URL
+}
+
+enum CallActivity: String {
+    case preparing = "Preparing call assistant"
+    case waitingForCallee = "Waiting for the callee"
+    case calleeSpeaking = "Callee speaking"
+    case assistantSpeaking = "Assistant speaking"
+    case waitingForAssistant = "Waiting for call assistant"
+    case assistantWorking = "Call assistant working"
+    case discussionOngoing = "Discussion ongoing"
+    case recoveringOutcome = "Recovering final appointment result"
+    case closing = "Closing call assistant"
 }
 
 enum AudioDumpPathResolver {
@@ -44,13 +61,49 @@ enum AudioDumpPathResolver {
 }
 
 enum LiveProtocol {
+    static func activity(for eventType: String, event: [String: Any]) -> CallActivity? {
+        switch eventType {
+        case "session.input_transcript.delta":
+            return .calleeSpeaking
+        case "session.output_transcript.delta":
+            return .assistantSpeaking
+        case "session.delegation.created":
+            return .waitingForAssistant
+        case "response.event":
+            guard let responseEvent = event["event"] as? [String: Any],
+                  let responseType = responseEvent["type"] as? String else { return nil }
+            switch responseType {
+            case "response.created":
+                return .assistantWorking
+            case "response.completed":
+                return .discussionOngoing
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
+
     static func sessionStart(
         voice: String,
         liveInstructions: String,
         backendInstructions: String,
-        callerContext: String
+        callerContext: String,
+        history: [LiveHistoryMessage] = []
     ) -> [String: Any] {
-        [
+        let historyInput: [[String: Any]] = history.map { message in
+            [
+                "type": "message",
+                "role": message.role,
+                "status": "completed",
+                "content": [[
+                    "type": message.role == "assistant" ? "output_text" : "input_text",
+                    "text": message.text,
+                ]],
+            ]
+        }
+        return [
             "type": "session.start",
             "event_id": "phonebt_session_start",
             "session": [
@@ -64,7 +117,7 @@ enum LiveProtocol {
                         "type": "input_text",
                         "text": callerContext,
                     ]],
-                ]],
+                ]] + historyInput,
                 "audio": [
                     "format": ["type": "audio/pcm", "rate": 24_000],
                     "output": ["voice": voice],
@@ -197,6 +250,9 @@ public final class CallSession: @unchecked Sendable {
     private let logger = PhoneBTLogger(category: .agent)
     private let stateQueue = DispatchQueue(label: "com.phonebt.realtime.session")
     private let audioDumper: RealtimeAudioDumper?
+    private static let maximumBufferedAudioBytes = 5 * 24_000 * MemoryLayout<Int16>.size
+    private static let maximumResumeTranscriptCharacters = 12_000
+    private static let maximumReconnectAttempts = 3
 
     private var webSocket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -206,8 +262,17 @@ public final class CallSession: @unchecked Sendable {
     private var isClosed = false
     private var hasReceivedOutputAudio = false
     private var pendingAudio: [Data] = []
+    private var pendingAudioByteCount = 0
+    private var transcriptHistory: [LiveHistoryMessage] = []
+    private var transcriptCharacterCount = 0
+    private var reconnectAttempts = 0
+    private var reconnectWorkItem: DispatchWorkItem?
     private var pendingResult: AppointmentResult?
     private var hasWrittenResult = false
+    private var activity: CallActivity = .preparing
+    private var activityGeneration = 0
+    private var callActivityStartedAt = Date()
+    private var statusHeartbeat: DispatchSourceTimer?
 
     public init(
         apiKey: String,
@@ -224,7 +289,7 @@ public final class CallSession: @unchecked Sendable {
         self.audioDumper = RealtimeAudioDumper.besideResultFile(resultURL, logger: logger)
     }
 
-    /// Connects and configures the model while the outgoing call is dialing.
+    /// Connects and configures the model after the outgoing call becomes active.
     public func prepare() {
         stateQueue.async { [weak self] in
             guard let self, self.webSocket == nil, !self.isClosed else { return }
@@ -257,15 +322,19 @@ public final class CallSession: @unchecked Sendable {
         let shouldRequestFinalOutcome: Bool? = stateQueue.sync {
             guard !isClosing, !isClosed else { return nil }
             isClosing = true
+            reconnectWorkItem?.cancel()
+            reconnectWorkItem = nil
             audioBridge?.shutdown()
             audioBridge = nil
             pendingAudio.removeAll()
+            pendingAudioByteCount = 0
             return finalizeOutcome && pendingResult == nil && isReady && webSocket != nil
         }
         guard let shouldRequestFinalOutcome else { return }
 
         if shouldRequestFinalOutcome {
             report("Call ended before an outcome was recorded; requesting final appointment result")
+            updateActivity(.recoveringOutcome)
             send(LiveProtocol.backendMessage(
                 "The telephone call has ended. Review the complete conversation and call " +
                 "record_appointment_outcome exactly once with the best supported final outcome. " +
@@ -285,11 +354,14 @@ public final class CallSession: @unchecked Sendable {
         let shouldClose: Bool = stateQueue.sync {
             guard !isClosed else { return false }
             isClosed = true
+            statusHeartbeat?.cancel()
+            statusHeartbeat = nil
             return true
         }
         guard shouldClose else { return }
 
         report("Closing GPT-Live session")
+        report("Status: \(CallActivity.closing.rawValue)")
         send([
             "type": "session.close",
             "event_id": "phonebt_session_close",
@@ -312,7 +384,9 @@ public final class CallSession: @unchecked Sendable {
                       let type = event["type"] as? String else { continue }
                 if type != "session.output_audio.delta" &&
                     type != "session.input_transcript.delta" &&
-                    type != "session.output_transcript.delta" {
+                    type != "session.output_transcript.delta" &&
+                    type != "response.event" &&
+                    type != "session.usage.updated" {
                     report("Server event: \(type)")
                 }
                 handleEvent(type: type, event: event)
@@ -320,6 +394,9 @@ public final class CallSession: @unchecked Sendable {
                 if !Task.isCancelled, !stateQueue.sync(execute: { isClosed }) {
                     logger.error("GPT-Live connection ended: \(error.localizedDescription)")
                     report("Connection ended: \(error.localizedDescription)")
+                    stateQueue.async { [weak self] in
+                        self?.handleUnexpectedTransportClose(reason: "connection_lost")
+                    }
                 }
                 return
             }
@@ -334,9 +411,16 @@ public final class CallSession: @unchecked Sendable {
                 self.isReady = true
                 let buffered = self.pendingAudio
                 self.pendingAudio.removeAll()
+                self.pendingAudioByteCount = 0
                 for data in buffered { self.sendAudioImmediately(data) }
                 self.logger.info("GPT-Live session ready")
+                if let session = event["session"] as? [String: Any],
+                   let expiresAt = session["expires_at"] {
+                    self.report("Session expires at \(String(describing: expiresAt))")
+                }
                 self.report("Session configured and waiting for the callee to speak")
+                self.setActivityOnQueue(.waitingForCallee)
+                self.startStatusHeartbeatOnQueue()
             }
         case "session.output_audio.delta":
             if let delta = event["delta"] as? String, let data = Data(base64Encoded: delta) {
@@ -348,17 +432,34 @@ public final class CallSession: @unchecked Sendable {
                 }
                 stateQueue.sync { audioBridge }?.play(data)
             }
+        case "session.input_transcript.delta":
+            appendTranscript(role: "user", delta: event["delta"] as? String)
+        case "session.output_transcript.delta":
+            appendTranscript(role: "assistant", delta: event["delta"] as? String)
         case "response.event":
             handleResponseEvent(event)
         case "session.closed":
-            report("Live session closed")
-            stateQueue.async { [weak self] in self?.finishTransportClose() }
+            let reason = event["reason"] as? String ?? "unknown"
+            report("Live session closed (reason: \(reason))")
+            stateQueue.async { [weak self] in
+                self?.handleUnexpectedTransportClose(reason: reason)
+            }
         case "error":
             let detail = (event["error"] as? [String: Any])?["message"] as? String ?? "Unknown GPT-Live API error"
             logger.error(detail)
             report("API error: \(detail)")
         default:
             break
+        }
+
+        if let activity = LiveProtocol.activity(for: type, event: event) {
+            let settlesAfter: TimeInterval? = switch activity {
+            case .calleeSpeaking, .assistantSpeaking:
+                1.5
+            default:
+                nil
+            }
+            updateActivity(activity, settlesAfter: settlesAfter)
         }
     }
 
@@ -367,7 +468,8 @@ public final class CallSession: @unchecked Sendable {
             voice: configuration.liveVoice,
             liveInstructions: livePrompt,
             backendInstructions: backendPrompt,
-            callerContext: callerContext
+            callerContext: callerContext,
+            history: transcriptHistory
         ))
     }
 
@@ -531,6 +633,11 @@ public final class CallSession: @unchecked Sendable {
                 self.sendAudioImmediately(data)
             } else {
                 self.pendingAudio.append(data)
+                self.pendingAudioByteCount += data.count
+                while self.pendingAudioByteCount > Self.maximumBufferedAudioBytes,
+                      !self.pendingAudio.isEmpty {
+                    self.pendingAudioByteCount -= self.pendingAudio.removeFirst().count
+                }
             }
         }
     }
@@ -556,6 +663,104 @@ public final class CallSession: @unchecked Sendable {
         receiveTask = nil
     }
 
+    private func handleUnexpectedTransportClose(reason: String) {
+        isReady = false
+        finishTransportClose()
+        guard !isClosing, !isClosed, device.currentState.call == .active else { return }
+        guard reconnectAttempts < Self.maximumReconnectAttempts else {
+            report("GPT-Live reconnection stopped after \(Self.maximumReconnectAttempts) attempts")
+            return
+        }
+
+        reconnectAttempts += 1
+        let delay = min(pow(2.0, Double(reconnectAttempts - 1)), 4.0)
+        report(
+            "Telephone call is still active; reconnecting GPT-Live " +
+            "(attempt \(reconnectAttempts)/\(Self.maximumReconnectAttempts), reason: \(reason))"
+        )
+        let workItem = DispatchWorkItem { [weak self] in self?.prepare() }
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = workItem
+        stateQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func appendTranscript(role: String, delta: String?) {
+        guard let delta, !delta.isEmpty else { return }
+        stateQueue.async { [weak self] in
+            guard let self, !self.isClosed else { return }
+            if let last = self.transcriptHistory.last, last.role == role {
+                self.transcriptCharacterCount -= last.text.count
+                self.transcriptHistory[self.transcriptHistory.count - 1] = LiveHistoryMessage(
+                    role: role,
+                    text: last.text + delta
+                )
+            } else {
+                self.transcriptHistory.append(LiveHistoryMessage(role: role, text: delta))
+            }
+            self.transcriptCharacterCount += delta.count
+            while self.transcriptCharacterCount > Self.maximumResumeTranscriptCharacters,
+                  self.transcriptHistory.count > 1 {
+                self.transcriptCharacterCount -= self.transcriptHistory.removeFirst().text.count
+            }
+            if self.transcriptCharacterCount > Self.maximumResumeTranscriptCharacters,
+               let last = self.transcriptHistory.last {
+                let trimmedText = String(
+                    last.text.suffix(Self.maximumResumeTranscriptCharacters)
+                )
+                self.transcriptHistory[self.transcriptHistory.count - 1] = LiveHistoryMessage(
+                    role: last.role,
+                    text: trimmedText
+                )
+                self.transcriptCharacterCount = trimmedText.count
+            }
+        }
+    }
+
+    private func updateActivity(
+        _ newActivity: CallActivity,
+        settlesAfter delay: TimeInterval? = nil
+    ) {
+        stateQueue.async { [weak self] in
+            guard let self, !self.isClosed else { return }
+            self.activityGeneration += 1
+            let generation = self.activityGeneration
+            self.setActivityOnQueue(newActivity)
+
+            guard let delay else { return }
+            self.stateQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      !self.isClosed,
+                      self.activityGeneration == generation else { return }
+                self.activityGeneration += 1
+                self.setActivityOnQueue(.discussionOngoing)
+            }
+        }
+    }
+
+    private func setActivityOnQueue(_ newActivity: CallActivity) {
+        guard activity != newActivity else { return }
+        activity = newActivity
+        report("Status: \(newActivity.rawValue)")
+    }
+
+    private func startStatusHeartbeatOnQueue() {
+        guard statusHeartbeat == nil else { return }
+        callActivityStartedAt = Date()
+        let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+        timer.schedule(deadline: .now() + 60, repeating: 60)
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.isClosed else { return }
+            let elapsed = max(0, Int(Date().timeIntervalSince(self.callActivityStartedAt)))
+            let minutes = elapsed / 60
+            let seconds = elapsed % 60
+            self.report(
+                "Status: \(self.activity.rawValue) (active for \(minutes)m \(seconds)s)"
+            )
+        }
+        statusHeartbeat = timer
+        timer.resume()
+    }
+
     private func report(_ message: String) {
         onDiagnostic(message)
     }
@@ -568,8 +773,12 @@ public final class CallSession: @unchecked Sendable {
 
         Ask or say one short thing at a time, then listen. Do not fill silence, repeat unanswered prompts, answer your own questions, or deliver a monologue. Do not mistake a cough, music, nearby conversation, or background speech for a request.
         
-        Before concluding that an appointment is booked, make sure both the date and specific time have been stated and confirmed. If either is missing, ask for it.
+        If the callee is requesting an alternate action like calling to another number or different unit, kindly accept the request.
+        
+        Before concluding the call, given that an appointment is provided, make sure both the date and specific time have been stated and confirmed. If either is missing, ask for it.
 
+        Automated responder policy: The callee may itself be an AI or other conversational automated assistant. If it can understand free-form speech and can book the appointment, cooperate with it and try to complete the booking through that system; do not request a human merely because the responder is automated. If the automated responder is only a menu, cannot complete the booking, repeatedly fails to understand the request, or explicitly says a staff member is required, follow its stated transfer instructions or ask to speak with a human receptionist. Do not claim to be human when interacting with either an automated responder or a person.
+        
         Backchannel policy: Use only occasional, quiet acknowledgements when they help the human speaker know you are listening. Never backchannel during an automated phone menu.
 
         Interruption policy: Stop speaking when the other person interrupts. Listen to the correction or new information before continuing.
@@ -577,12 +786,12 @@ public final class CallSession: @unchecked Sendable {
         Delegation policy:
         Backend tools:
         - Send one telephone keypad tone for an automated IVR menu.
-        - Checkpoint confirmed appointment information without ending the call.
+        - Checkpoint confirmed appointment information without ending the call or additional instructions provided.
         - End the telephone call after the latest outcome has been checkpointed.
 
         Delegate to the backend when:
         - An automated menu explicitly requests a keypad selection.
-        - The callee confirms an appointment date and time or confirms that no appointment can be made. Delegate immediately so the outcome is checkpointed even if the callee hangs up next.
+        - The callee confirms an appointment date and time or confirms that no appointment can be made or provide alternate instruction to book an appointment. Delegate immediately so the outcome is checkpointed even if the callee hangs up next.
         - The appointment objective is complete or cannot be completed and you have finished saying your final goodbye.
         - Careful reasoning about the appointment workflow or final structured outcome is needed.
 
@@ -596,7 +805,9 @@ public final class CallSession: @unchecked Sendable {
 
     private var callerContext: String {
         """
-        Trusted caller facts supplied by the application follow. Use these exact values when the callee requests them. Do not infer, alter, substitute, or invent a name, date of birth, insurance value, or additional detail. Only provide requested information. Never provide information without a specific request. If a value is empty, say that the information was not provided. Do not read these facts aloud unless they are relevant or requested.
+        Trusted caller facts supplied by the application follow. Use these exact values when the callee requests them. Do not infer, alter, substitute, or invent a name, date of birth, telephone number, insurance value, referral detail, or additional detail. Only provide requested information. Never provide information without a specific request. If a value is empty, say that the information was not provided. Do not read these facts aloud unless they are relevant or requested.
+
+        Doctor referral details may contain German medical terminology even when the conversation language is different. Interpret the terminology accurately, preserve identifiers and document values verbatim, and provide individual referral details only when relevant or requested.
 
         \(configurationJSON)
         """
@@ -607,6 +818,8 @@ public final class CallSession: @unchecked Sendable {
         You are the task backend for a live voice assistant making a doctor appointment. The voice assistant manages the spoken conversation. You reason about the workflow, select tools, and produce accurate structured outcomes.
 
         Use the trusted caller facts supplied in the conversation context. Preserve their exact values and never infer, alter, substitute, or invent missing facts. The application has already dialed the call; never attempt to dial or answer it. Provide caller facts only when relevant or requested. Do not treat an appointment as booked unless the callee explicitly confirms it.
+
+        The remote party may be a conversational AI or another automated appointment assistant. If that system can conduct the booking, support the voice assistant in completing the appointment with it. Do not seek a human solely because the remote party is automated. If the automated system cannot perform the booking, repeatedly cannot understand the request, or requires staff intervention, support navigating an explicitly offered transfer or asking for a human receptionist. A conventional keypad IVR remains subject to the DTMF rules below.
 
         For an automated menu, call send_dtmf only when the system explicitly requests a keypad selection. Send exactly one requested tone per tool call. For a multi-digit selection or extension, issue one tool call per tone in the requested order. Never guess a menu choice and never encode personal information as keypad tones unless explicitly requested.
 

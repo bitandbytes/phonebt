@@ -19,7 +19,7 @@ all targets ← PhoneBT executable
 - `AgentBridge`: call configuration and result models, result persistence, and the OpenAI GPT-Live WebSocket session with Responses-delegated `send_dtmf` and `end_call` tools.
 - `PhoneBT`: terminal commands and lifecycle wiring.
 
-HFP callbacks—not the model—own call state. The CLI loads `call <number> --config <file>`, dials, and prepares the GPT-Live session. Only `.callActive` starts audio streaming. Call end/disconnect closes the session, writes the timestamped appointment-result JSON beside the input configuration, stops audio, and restores routing. The delegated backend may end an active call after GPT-Live completes the conversation; terminal `hangup` remains a safety override.
+HFP callbacks—not the model—own call state. The CLI loads `call <number> --config <file>` and dials without opening GPT-Live during ringing. `.callActive` starts the GPT-Live session and audio streaming together; input captured during startup is held in a bounded rolling buffer. Call end/disconnect closes the session, writes the timestamped appointment-result JSON beside the input configuration, stops audio, and restores routing. The delegated backend may end an active call after GPT-Live completes the conversation; terminal `hangup` remains a safety override.
 
 There is intentionally no separate STT, TTS, text LLM abstraction, provider selection, or agent REPL.
 

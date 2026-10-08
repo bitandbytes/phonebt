@@ -20,6 +20,11 @@ import Shared
 public final class HFPDelegate: NSObject, IOBluetoothHandsFreeDeviceDelegate, @unchecked Sendable {
     private let eventStream: HFPEventStream
     private let logger = PhoneBTLogger(category: .hfp)
+    private let callStateLock = NSLock()
+    private var callSetupState = 0
+    private var callIndicatorActive = false
+    private var hasObservedCallLifecycle = false
+    private var setupEndWorkItem: DispatchWorkItem?
 
     public init(eventStream: HFPEventStream) {
         self.eventStream = eventStream
@@ -47,6 +52,7 @@ public final class HFPDelegate: NSObject, IOBluetoothHandsFreeDeviceDelegate, @u
                           disconnected status: NSNumber!) {
         let statusCode = status?.intValue ?? -1
         logger.info("Delegate: disconnected, status=\(statusCode)")
+        resetCallTracking()
         eventStream.emit(.disconnected(nil))
     }
 
@@ -56,6 +62,7 @@ public final class HFPDelegate: NSObject, IOBluetoothHandsFreeDeviceDelegate, @u
                           callSetupMode mode: NSNumber!) {
         let setupState = mode?.intValue ?? 0
         logger.info("Delegate: callSetup = \(setupState)")
+        let shouldResolveEndedCall = updateCallSetupTracking(setupState)
         eventStream.emit(.callSetup(setupState))
 
         switch setupState {
@@ -66,8 +73,11 @@ public final class HFPDelegate: NSObject, IOBluetoothHandsFreeDeviceDelegate, @u
         case 3:
             eventStream.emit(.callAlerting)
         case 0:
-            // Setup ended — call connected or released
-            break
+            // The call either connected or the unanswered attempt ended. Give
+            // the call indicator a brief chance to report an active call.
+            if shouldResolveEndedCall {
+                scheduleUnansweredCallResolution()
+            }
         default:
             break
         }
@@ -77,13 +87,85 @@ public final class HFPDelegate: NSObject, IOBluetoothHandsFreeDeviceDelegate, @u
                           isCallActive: NSNumber!) {
         let active = isCallActive?.boolValue ?? false
         logger.info("Delegate: callActive = \(active)")
+        let shouldEmitCallEnded = updateCallIndicatorTracking(active)
         eventStream.emit(.callIndicator(active))
 
         if active {
             eventStream.emit(.callActive)
-        } else {
+        } else if shouldEmitCallEnded {
             eventStream.emit(.callEnded)
         }
+    }
+
+    private func updateCallSetupTracking(_ setupState: Int) -> Bool {
+        callStateLock.lock()
+        defer { callStateLock.unlock() }
+
+        setupEndWorkItem?.cancel()
+        setupEndWorkItem = nil
+        let previousSetupState = callSetupState
+        callSetupState = setupState
+        if (1...3).contains(setupState) {
+            hasObservedCallLifecycle = true
+        }
+        return setupState == 0 &&
+            previousSetupState != 0 &&
+            hasObservedCallLifecycle &&
+            !callIndicatorActive
+    }
+
+    private func updateCallIndicatorTracking(_ active: Bool) -> Bool {
+        callStateLock.lock()
+        defer { callStateLock.unlock() }
+
+        setupEndWorkItem?.cancel()
+        setupEndWorkItem = nil
+        let wasActive = callIndicatorActive
+        callIndicatorActive = active
+        if active {
+            hasObservedCallLifecycle = true
+            return false
+        }
+        guard hasObservedCallLifecycle,
+              wasActive || callSetupState == 0 else { return false }
+        hasObservedCallLifecycle = false
+        return true
+    }
+
+    private func scheduleUnansweredCallResolution() {
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.resolveUnansweredCallIfNeeded()
+        }
+        callStateLock.lock()
+        setupEndWorkItem = workItem
+        callStateLock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.75, execute: workItem)
+    }
+
+    private func resolveUnansweredCallIfNeeded() {
+        callStateLock.lock()
+        guard callSetupState == 0,
+              !callIndicatorActive,
+              hasObservedCallLifecycle else {
+            callStateLock.unlock()
+            return
+        }
+        hasObservedCallLifecycle = false
+        setupEndWorkItem = nil
+        callStateLock.unlock()
+
+        logger.info("Delegate: call setup ended without becoming active")
+        eventStream.emit(.callEnded)
+    }
+
+    private func resetCallTracking() {
+        callStateLock.lock()
+        setupEndWorkItem?.cancel()
+        setupEndWorkItem = nil
+        callSetupState = 0
+        callIndicatorActive = false
+        hasObservedCallLifecycle = false
+        callStateLock.unlock()
     }
 
     public func handsFree(_ device: IOBluetoothHandsFreeDevice!,

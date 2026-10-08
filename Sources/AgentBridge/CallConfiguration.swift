@@ -26,6 +26,8 @@ public struct CallConfiguration: Codable, Sendable {
     public let additionalDetails: String
     public let gender: VoiceGender?
     public let language: String?
+    public let telephoneNumber: String?
+    public let doctorReferralDetails: [String: String]?
 
     public init(
         name: String,
@@ -33,7 +35,9 @@ public struct CallConfiguration: Codable, Sendable {
         insurance: String,
         additionalDetails: String,
         gender: VoiceGender? = nil,
-        language: String? = nil
+        language: String? = nil,
+        telephoneNumber: String? = nil,
+        doctorReferralDetails: [String: String]? = nil
     ) {
         self.name = name
         self.dateOfBirth = dateOfBirth
@@ -41,6 +45,8 @@ public struct CallConfiguration: Codable, Sendable {
         self.additionalDetails = additionalDetails
         self.gender = gender
         self.language = language
+        self.telephoneNumber = telephoneNumber
+        self.doctorReferralDetails = doctorReferralDetails
     }
 
     var liveVoice: String {
