@@ -109,4 +109,12 @@ Hardware and live API behavior require an end-to-end call test; unit tests cover
 
 ## License
 
-Copyright 2026 ICOA Inc. Licensed under the Apache License, Version 2.0.
+This project is a substantially modified derivative of
+[icoainc/phonebt](https://github.com/icoainc/phonebt).
+
+Original work Copyright 2026 ICOA Inc.
+
+Modifications Copyright 2026 Ravindu Kumarasiri.
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE) for details.
