@@ -48,8 +48,9 @@ import Testing
     #expect(responses["model"] as? String == "gpt-6.1-sol")
     #expect(responses["parallel_tool_calls"] as? Bool == false)
     let tools = try #require(responses["tools"] as? [[String: Any]])
-    #expect(tools.count == 3)
+    #expect(tools.count == 4)
     #expect(tools.contains { $0["name"] as? String == "record_appointment_outcome" })
+    #expect(tools.contains { $0["name"] as? String == "set_input_volume" })
 }
 
 @Test func liveAudioAppendEncodesPCMBytes() {
@@ -160,6 +161,15 @@ import Testing
     #expect(!LiveProtocol.isValidDTMFTone("12"))
     #expect(!LiveProtocol.isValidDTMFTone("A"))
     #expect(!LiveProtocol.isValidDTMFTone(""))
+}
+
+@Test func inputVolumeValidationAcceptsOnlySupportedDecibels() {
+    #expect(LiveProtocol.inputVolumeDecibels(from: ["decibels": 1]) == 1)
+    #expect(LiveProtocol.inputVolumeDecibels(from: ["decibels": 12.5]) == 12.5)
+    #expect(LiveProtocol.inputVolumeDecibels(from: ["decibels": 29]) == 29)
+    #expect(LiveProtocol.inputVolumeDecibels(from: ["decibels": 0]) == nil)
+    #expect(LiveProtocol.inputVolumeDecibels(from: ["decibels": 30]) == nil)
+    #expect(LiveProtocol.inputVolumeDecibels(from: ["decibels": "12"]) == nil)
 }
 
 @Test func audioDumpPathsAreCreatedBesideTheResultFile() {

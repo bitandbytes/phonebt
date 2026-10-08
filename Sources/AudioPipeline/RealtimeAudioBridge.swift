@@ -156,6 +156,10 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
         logger.info("GPT-Live audio capture stopped")
     }
 
+    public func setInputVolume(decibels: Float32) throws {
+        try sessionManager.setInputVolume(decibels: decibels)
+    }
+
     public func play(_ pcm16Data: Data) {
         guard !pcm16Data.isEmpty else { return }
         playbackQueue.async { [weak self] in

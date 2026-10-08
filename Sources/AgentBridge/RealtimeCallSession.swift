@@ -127,7 +127,7 @@ enum LiveProtocol {
                     "responses": [
                         "model": CallSession.backendModel,
                         "instructions": backendInstructions,
-                        "reasoning": ["effort": "low"],
+                        "reasoning": ["effort": "medium"],
                         "parallel_tool_calls": false,
                         "tools": toolDefinitions,
                         "tool_choice": "auto",
@@ -197,6 +197,13 @@ enum LiveProtocol {
         tone.count == 1 && tone.first.map { "0123456789*#".contains($0) } == true
     }
 
+    static func inputVolumeDecibels(from arguments: [String: Any]) -> Float32? {
+        guard let number = arguments["decibels"] as? NSNumber else { return nil }
+        let decibels = number.floatValue
+        guard decibels.isFinite, (1.0...29.0).contains(decibels) else { return nil }
+        return decibels
+    }
+
     private static let toolDefinitions: [[String: Any]] = [[
         "type": "function",
         "name": "end_call",
@@ -234,6 +241,22 @@ enum LiveProtocol {
                 ],
             ],
             "required": ["tone"],
+        ],
+    ], [
+        "type": "function",
+        "name": "set_input_volume",
+        "description": "Set the active call input device's hardware gain from 1 through 29 dB when the remote caller remains consistently too quiet to understand. Increase gradually and do not use for silence, a brief quiet phrase, or output-speaker volume.",
+        "parameters": [
+            "type": "object",
+            "properties": [
+                "decibels": [
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 29,
+                    "description": "Absolute input hardware gain in decibels, not an increment.",
+                ],
+            ],
+            "required": ["decibels"],
         ],
     ]]
 }
@@ -484,6 +507,11 @@ public final class CallSession: @unchecked Sendable {
             return
         }
 
+        if call.name == "set_input_volume" {
+            performSetInputVolume(arguments: call.arguments, callID: call.callID)
+            return
+        }
+
         if call.name == "record_appointment_outcome" {
             if let error = recordResult(arguments: call.arguments) {
                 let result = "{\"success\":false,\"error\":\"\(escapeJSON(error))\"}"
@@ -541,6 +569,47 @@ public final class CallSession: @unchecked Sendable {
         } catch {
             logger.error("GPT-Live backend could not send DTMF: \(error.localizedDescription)")
             report("Could not send DTMF tone: \(error.localizedDescription)")
+            if let callID {
+                let result = "{\"success\":false,\"error\":\"\(escapeJSON(error.localizedDescription))\"}"
+                sendFunctionResult(callID: callID, result: result)
+            }
+        }
+    }
+
+    private func performSetInputVolume(arguments: [String: Any], callID: String?) {
+        guard let decibels = LiveProtocol.inputVolumeDecibels(from: arguments) else {
+            report("GPT-Live backend requested an invalid input volume")
+            if let callID {
+                sendFunctionResult(
+                    callID: callID,
+                    result: "{\"success\":false,\"error\":\"Input volume must be from 1 through 29 dB\"}"
+                )
+            }
+            return
+        }
+
+        guard let bridge = stateQueue.sync(execute: { audioBridge }) else {
+            if let callID {
+                sendFunctionResult(
+                    callID: callID,
+                    result: "{\"success\":false,\"error\":\"Call audio is not active\"}"
+                )
+            }
+            return
+        }
+
+        do {
+            try bridge.setInputVolume(decibels: decibels)
+            report("Adjusted call input volume to \(decibels) dB")
+            if let callID {
+                sendFunctionResult(
+                    callID: callID,
+                    result: "{\"success\":true,\"decibels\":\(decibels)}"
+                )
+            }
+        } catch {
+            logger.error("Could not adjust call input volume: \(error.localizedDescription)")
+            report("Could not adjust call input volume: \(error.localizedDescription)")
             if let callID {
                 let result = "{\"success\":false,\"error\":\"\(escapeJSON(error.localizedDescription))\"}"
                 sendFunctionResult(callID: callID, result: result)
@@ -786,11 +855,13 @@ public final class CallSession: @unchecked Sendable {
         Delegation policy:
         Backend tools:
         - Send one telephone keypad tone for an automated IVR menu.
+        - Adjust the active call input volume when the remote speaker remains consistently too quiet to understand.
         - Checkpoint confirmed appointment information without ending the call or additional instructions provided.
         - End the telephone call after the latest outcome has been checkpointed.
 
         Delegate to the backend when:
         - An automated menu explicitly requests a keypad selection.
+        - The remote speaker remains consistently too quiet to understand across multiple speech attempts. Do not delegate for silence, line noise, or one briefly quiet phrase.
         - The callee confirms an appointment date and time or confirms that no appointment can be made or provide alternate instruction to book an appointment. Delegate immediately so the outcome is checkpointed even if the callee hangs up next.
         - The appointment objective is complete or cannot be completed and you have finished saying your final goodbye.
         - Careful reasoning about the appointment workflow or final structured outcome is needed.
@@ -822,6 +893,8 @@ public final class CallSession: @unchecked Sendable {
         The remote party may be a conversational AI or another automated appointment assistant. If that system can conduct the booking, support the voice assistant in completing the appointment with it. Do not seek a human solely because the remote party is automated. If the automated system cannot perform the booking, repeatedly cannot understand the request, or requires staff intervention, support navigating an explicitly offered transfer or asking for a human receptionist. A conventional keypad IVR remains subject to the DTMF rules below.
 
         For an automated menu, call send_dtmf only when the system explicitly requests a keypad selection. Send exactly one requested tone per tool call. For a multi-digit selection or extension, issue one tool call per tone in the requested order. Never guess a menu choice and never encode personal information as keypad tones unless explicitly requested.
+
+        When GPT-Live reports that incoming speech remains consistently too quiet to understand, call set_input_volume with an absolute gain from 1 through 29 dB. Increase gain gradually, beginning with a modest value such as 5 dB, and wait for further speech before changing it again. Do not change input gain because of silence, a single quiet phrase, or poor comprehension caused by language, noise, or unclear wording. This tool controls incoming call audio only, not the assistant's output volume.
 
         If an appointment is offered, make sure the voice conversation confirms the date and time naturally. Preserve the confirmed date, time, practice, and useful details. Do not challenge the callee's stated calendar date unless they correct it.
         

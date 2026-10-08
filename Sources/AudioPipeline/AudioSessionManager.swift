@@ -23,6 +23,7 @@ public final class AudioSessionManager: @unchecked Sendable {
     public let engine: AVAudioEngine
     public let playerNode: AVAudioPlayerNode
     private let logger = PhoneBTLogger(category: .audio)
+    private var configuredInputDeviceID: AudioDeviceID?
 
     public init() {
         self.engine = AVAudioEngine()
@@ -37,12 +38,13 @@ public final class AudioSessionManager: @unchecked Sendable {
 
         try setDevice(inputDeviceID, on: inputUnit)
         try setDevice(outputDeviceID, on: outputUnit)
+        configuredInputDeviceID = inputDeviceID
 
         setDeviceVolume(
             deviceID: inputDeviceID,
             scope: kAudioDevicePropertyScopeInput,
             element: kAudioObjectPropertyElementMain,
-            decibels: 1.0,
+            decibels: 2.0,
             label: "input master"
         )
         setDeviceVolume(
@@ -99,6 +101,19 @@ public final class AudioSessionManager: @unchecked Sendable {
         playerNode.stop()
         engine.stop()
         logger.info("Audio engine stopped")
+    }
+
+    /// Adjusts the active call input device's hardware gain.
+    public func setInputVolume(decibels: Float32) throws {
+        guard (1.0...29.0).contains(decibels) else {
+            throw AudioSessionError.invalidInputVolume(decibels)
+        }
+        guard let configuredInputDeviceID else {
+            throw AudioSessionError.inputDeviceNotConfigured
+        }
+
+        try applyInputDeviceVolume(deviceID: configuredInputDeviceID, decibels: decibels)
+        logger.info("Active call input volume set to \(decibels) dB")
     }
 
     // MARK: - Private
@@ -165,11 +180,46 @@ private extension AudioSessionManager {
 
         logger.info("Selected device \(label) set to \(decibels) dB")
     }
+
+    func applyInputDeviceVolume(deviceID: AudioDeviceID, decibels: Float32) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeDecibels,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else {
+            throw AudioSessionError.volumeControlUnavailable("input master")
+        }
+
+        var isSettable = DarwinBoolean(false)
+        let settableStatus = AudioObjectIsPropertySettable(deviceID, &address, &isSettable)
+        guard settableStatus == noErr, isSettable.boolValue else {
+            throw AudioSessionError.volumeControlNotWritable("input master")
+        }
+
+        var value = decibels
+        let status = AudioObjectSetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<Float32>.size),
+            &value
+        )
+        guard status == noErr else {
+            throw AudioSessionError.volumeChangeFailed("input master", status)
+        }
+    }
 }
 
 public enum AudioSessionError: Error, LocalizedError {
     case deviceConfigFailed(OSStatus)
     case deviceNotFound(String)
+    case inputDeviceNotConfigured
+    case invalidInputVolume(Float32)
+    case volumeControlUnavailable(String)
+    case volumeControlNotWritable(String)
+    case volumeChangeFailed(String, OSStatus)
 
     public var errorDescription: String? {
         switch self {
@@ -177,6 +227,16 @@ public enum AudioSessionError: Error, LocalizedError {
             return "Failed to configure audio device (OSStatus \(status))"
         case .deviceNotFound(let uid):
             return "Audio device not found: \(uid)"
+        case .inputDeviceNotConfigured:
+            return "The call input device is not configured"
+        case .invalidInputVolume(let decibels):
+            return "Input volume \(decibels) dB is outside the supported 1–29 dB range"
+        case .volumeControlUnavailable(let label):
+            return "Selected device has no \(label) volume control"
+        case .volumeControlNotWritable(let label):
+            return "Selected device's \(label) volume control is not writable"
+        case .volumeChangeFailed(let label, let status):
+            return "Could not set selected device \(label) (OSStatus \(status))"
         }
     }
 }
