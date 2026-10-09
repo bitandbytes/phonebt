@@ -109,7 +109,7 @@ enum LiveProtocol {
             "type": "session.start",
             "event_id": "phonebt_session_start",
             "session": [
-                "model": CallSession.model,
+                "model": AgentSession.model,
                 "instructions": liveInstructions,
                 "input": [[
                     "type": "message",
@@ -127,7 +127,7 @@ enum LiveProtocol {
                 "delegation": [
                     "type": "responses",
                     "responses": [
-                        "model": CallSession.backendModel,
+                        "model": AgentSession.backendModel,
                         "instructions": backendInstructions,
                         "reasoning": ["effort": "medium"],
                         "parallel_tool_calls": false,
@@ -263,25 +263,25 @@ enum LiveProtocol {
     ]]
 }
 
-public final class CallSession: @unchecked Sendable {
+public final class AgentSession: @unchecked Sendable {
     public static let model = "gpt-live-1"
     public static let backendModel = "gpt-6.1-sol"
 
     private let apiKey: String
-    private let configuration: CallConfiguration
+    private let configuration: InputConfiguration
     private let resultURL: URL
     private let device: HFPDevice
     private let onDiagnostic: @Sendable (String) -> Void
     private let logger = PhoneBTLogger(category: .agent)
     private let stateQueue = DispatchQueue(label: "com.phonebt.realtime.session")
-    private let audioDumper: RealtimeAudioDumper?
+    private let audioDumper: AudioDumper?
     private static let maximumBufferedAudioBytes = 5 * 24_000 * MemoryLayout<Int16>.size
     private static let maximumResumeTranscriptCharacters = 12_000
     private static let maximumReconnectAttempts = 3
 
     private var webSocket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
-    private var audioBridge: RealtimeAudioBridge?
+    private var audioBridge: AudioBridge?
     private var isReady = false
     private var isClosing = false
     private var isClosed = false
@@ -301,7 +301,7 @@ public final class CallSession: @unchecked Sendable {
 
     public init(
         apiKey: String,
-        configuration: CallConfiguration,
+        configuration: InputConfiguration,
         resultURL: URL,
         device: HFPDevice,
         onDiagnostic: @escaping @Sendable (String) -> Void = { _ in }
@@ -311,7 +311,7 @@ public final class CallSession: @unchecked Sendable {
         self.resultURL = resultURL
         self.device = device
         self.onDiagnostic = onDiagnostic
-        self.audioDumper = RealtimeAudioDumper.besideResultFile(resultURL, logger: logger)
+        self.audioDumper = AudioDumper.besideResultFile(resultURL, logger: logger)
     }
 
     /// Connects and configures the model after the outgoing call becomes active.
@@ -333,7 +333,7 @@ public final class CallSession: @unchecked Sendable {
 
     /// Starts forwarding call audio after HFP reports that the call is active.
     public func startAudio(using sessionManager: AudioSessionManager) throws {
-        let bridge = RealtimeAudioBridge(sessionManager: sessionManager)
+        let bridge = AudioBridge(sessionManager: sessionManager)
         try bridge.startCapture { [weak self] data in
             self?.sendAudio(data)
         }
@@ -437,7 +437,7 @@ public final class CallSession: @unchecked Sendable {
                 let buffered = self.pendingAudio
                 self.pendingAudio.removeAll()
                 self.pendingAudioByteCount = 0
-                for data in buffered { self.sendAudioImmediately(data) }
+                for data in buffered { self.sendAudioBuffer(data) }
                 self.logger.info("GPT-Live session ready")
                 if let session = event["session"] as? [String: Any],
                    let expiresAt = session["expires_at"] {
@@ -701,7 +701,7 @@ public final class CallSession: @unchecked Sendable {
         stateQueue.async { [weak self] in
             guard let self, !self.isClosing, !self.isClosed else { return }
             if self.isReady {
-                self.sendAudioImmediately(data)
+                self.sendAudioBuffer(data)
             } else {
                 self.pendingAudio.append(data)
                 self.pendingAudioByteCount += data.count
@@ -713,7 +713,7 @@ public final class CallSession: @unchecked Sendable {
         }
     }
 
-    private func sendAudioImmediately(_ data: Data) {
+    private func sendAudioBuffer(_ data: Data) {
         audioDumper?.appendInput(data)
         send(LiveProtocol.audioAppend(data))
     }
@@ -920,20 +920,20 @@ public final class CallSession: @unchecked Sendable {
 }
 
 /// Writes the exact PCM16 byte streams crossing the GPT-Live API boundary.
-/// Files are created beside the call configuration and result files.
-private final class RealtimeAudioDumper: @unchecked Sendable {
+/// Files are created beside the input configuration and result files.
+private final class AudioDumper: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.phonebt.realtime.audio-dump")
     private let inputHandle: FileHandle
     private let outputHandle: FileHandle
     private var isClosed = false
 
-    static func besideResultFile(_ resultURL: URL, logger: PhoneBTLogger) -> RealtimeAudioDumper? {
+    static func besideResultFile(_ resultURL: URL, logger: PhoneBTLogger) -> AudioDumper? {
         do {
             let paths = AudioDumpPathResolver.paths(beside: resultURL)
             try Data().write(to: paths.inputURL, options: .atomic)
             try Data().write(to: paths.outputURL, options: .atomic)
 
-            let dumper = try RealtimeAudioDumper(
+            let dumper = try AudioDumper(
                 inputURL: paths.inputURL,
                 outputURL: paths.outputURL
             )

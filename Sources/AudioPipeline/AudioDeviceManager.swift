@@ -229,11 +229,11 @@ public final class AudioDeviceManager: Sendable {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var name: CFString = "" as CFString
-        var dataSize = UInt32(MemoryLayout<CFString>.size)
+        var name: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout.size(ofValue: name))
         let status = AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, &name)
-        guard status == noErr else { return nil }
-        return name as String
+        guard status == noErr, let name else { return nil }
+        return name.takeUnretainedValue() as String
     }
 
     private func getTransportType(_ deviceID: AudioDeviceID) -> UInt32 {

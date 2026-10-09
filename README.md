@@ -24,7 +24,7 @@ swift run PhoneBT
 swift run --build-system native PhoneBT
 ```
 
-Typical flow. First create a call configuration, for example `appointment.json`:
+Typical flow. First create an input configuration, for example `appointment.json`:
 
 ```json
 {
@@ -91,7 +91,7 @@ log stream --level debug --predicate 'subsystem == "com.phonebt"'
 
 - `HFPCore` owns Bluetooth HFP callbacks, commands, the event stream, and call state.
 - `AudioPipeline` owns CoreAudio device routing and PCM16 conversion for GPT-Live audio.
-- `AgentBridge` owns call configuration, result JSON persistence, the OpenAI GPT-Live WebSocket session, Responses delegation, and the `send_dtmf` and `end_call` tools.
+- `AgentBridge` owns input configuration, result JSON persistence, the OpenAI GPT-Live WebSocket session, Responses delegation, and the backend tools.
 - `PhoneBT` owns the terminal commands and wires call events to session lifecycle.
 
 There is intentionally no separate STT, TTS, model selector, or agent mode. GPT-Live consumes and produces audio directly; its configured Responses backend handles delegated reasoning and tools.

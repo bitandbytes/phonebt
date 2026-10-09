@@ -21,7 +21,7 @@ public enum VoiceGender: String, Codable, Sendable {
     case male
 }
 
-public struct CallConfiguration: Codable, Sendable {
+public struct InputConfiguration: Codable, Sendable {
     public let name: String
     public let dateOfBirth: String
     public let insurance: String

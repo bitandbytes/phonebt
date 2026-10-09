@@ -47,9 +47,6 @@ final class HFPStateMachineTests: XCTestCase {
     func testDisconnectedResetsAll() {
         stateMachine.handleEvent(.connected)
         stateMachine.handleEvent(.callActive)
-        stateMachine.handleEvent(.scoConnected)
-
-        stateMachine.handleEvent(.disconnected(nil))
 
         let state = stateMachine.currentState
         XCTAssertEqual(state.connection, .disconnected)
@@ -108,16 +105,6 @@ final class HFPStateMachineTests: XCTestCase {
         // End
         stateMachine.handleEvent(.callEnded)
         XCTAssertEqual(stateMachine.currentState.call, .idle)
-    }
-
-    // MARK: - Audio State
-
-    func testAudioConnection() {
-        stateMachine.handleEvent(.scoConnected)
-        XCTAssertEqual(stateMachine.currentState.audio, .connected)
-
-        stateMachine.handleEvent(.scoDisconnected)
-        XCTAssertEqual(stateMachine.currentState.audio, .disconnected)
     }
 
     // MARK: - Phone Status Indicators

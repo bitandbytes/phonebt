@@ -75,11 +75,11 @@ public final class HFPDevice: @unchecked Sendable {
     public func connect(timeout: TimeInterval = 15) async throws {
         logger.info("Connecting to \(deviceName)...")
 
+        // Register before connect() because HFPEventStream does not replay events.
+        let stream = eventStream.makeStream()
+
         // connect() initiates SLC (Service Level Connection) automatically
         device.connect()
-
-        // Wait for connection event with timeout
-        let stream = eventStream.makeStream()
 
         // Use a task group to race the event stream against a timeout
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -163,29 +163,6 @@ public final class HFPDevice: @unchecked Sendable {
         }
         logger.info("Sending DTMF: \(digit)")
         device.sendDTMF(digit)
-    }
-
-    // MARK: - Audio
-
-    public func connectAudio() throws {
-        guard currentState.connection == .connected else {
-            throw BluetoothError.notConnected
-        }
-        logger.info("Connecting SCO audio")
-        device.connectSCO()
-    }
-
-    public func disconnectAudio() {
-        logger.info("Disconnecting SCO audio")
-        device.disconnectSCO()
-    }
-
-    public func transferAudioToComputer() throws {
-        guard currentState.connection == .connected else {
-            throw BluetoothError.notConnected
-        }
-        logger.info("Transferring audio to computer")
-        device.transferAudioToComputer()
     }
 
     // MARK: - AT Commands

@@ -25,7 +25,7 @@ public enum LogCategory: String {
     case app = "App"
 }
 
-public struct PhoneBTLogger {
+public struct PhoneBTLogger: Sendable {
     private let logger: os.Logger
 
     public init(category: LogCategory) {

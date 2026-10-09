@@ -121,14 +121,6 @@ public final class HFPStateMachine: @unchecked Sendable {
         case .callWaiting(let number):
             logger.info("State: call waiting from \(number ?? "unknown")")
 
-        case .scoConnected:
-            state.audio = .connected
-            logger.info("State: SCO audio connected")
-
-        case .scoDisconnected:
-            state.audio = .disconnected
-            logger.info("State: SCO audio disconnected")
-
         case .signalStrength(let strength):
             state.phoneStatus.signalStrength = strength
 

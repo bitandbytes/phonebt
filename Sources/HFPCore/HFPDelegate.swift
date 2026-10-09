@@ -212,18 +212,4 @@ public final class HFPDelegate: NSObject, IOBluetoothHandsFreeDeviceDelegate, @u
         eventStream.emit(.callerID(number: num, name: nil))
         eventStream.emit(.incomingCall(number: num))
     }
-
-    // MARK: - SCO Audio
-
-    public func handsFree(_ device: IOBluetoothHandsFree!,
-                          scoConnectionOpened status: NSNumber!) {
-        logger.info("Delegate: SCO opened, status=\(status ?? 0)")
-        eventStream.emit(.scoConnected)
-    }
-
-    public func handsFree(_ device: IOBluetoothHandsFree!,
-                          scoConnectionClosed status: NSNumber!) {
-        logger.info("Delegate: SCO closed, status=\(status ?? 0)")
-        eventStream.emit(.scoDisconnected)
-    }
 }

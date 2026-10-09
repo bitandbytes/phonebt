@@ -19,7 +19,7 @@ import Foundation
 import Shared
 
 /// Converts between the call device's native format and GPT-Live PCM16 audio.
-public final class RealtimeAudioBridge: @unchecked Sendable {
+public final class AudioBridge: @unchecked Sendable {
     private struct PlaybackCompletionWaiter {
         let id: UUID
         let completion: @Sendable (Bool) -> Void
@@ -60,7 +60,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
                 interleaved: true
               ),
               let converter = AVAudioConverter(from: inputFormat, to: realtimeFormat) else {
-            throw RealtimeAudioError.unsupportedInputFormat
+            throw AudioError.unsupportedInputFormat
         }
 
         let gateThreshold = Int(
@@ -308,7 +308,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     }
 }
 
-public enum RealtimeAudioError: Error, LocalizedError {
+public enum AudioError: Error, LocalizedError {
     case unsupportedInputFormat
 
     public var errorDescription: String? {

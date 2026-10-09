@@ -18,9 +18,9 @@
 import Foundation
 import Testing
 
-@Test func callConfigurationDecodesFromJSON() throws {
+@Test func inputConfigurationDecodesFromJSON() throws {
     let data = Data(#"{"name":"Jane Doe","dateOfBirth":"1990-05-20","insurance":"Example Health","additionalDetails":"Morning preferred","gender":"female","language":"German"}"#.utf8)
-    let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+    let configuration = try JSONDecoder().decode(InputConfiguration.self, from: data)
 
     #expect(configuration.name == "Jane Doe")
     #expect(configuration.insurance == "Example Health")
@@ -32,14 +32,14 @@ import Testing
 
 @Test func maleGenderSelectsCedarVoice() throws {
     let data = Data(#"{"name":"John Doe","dateOfBirth":"1990-05-20","insurance":"Example Health","additionalDetails":"Morning preferred","gender":"male"}"#.utf8)
-    let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+    let configuration = try JSONDecoder().decode(InputConfiguration.self, from: data)
 
     #expect(configuration.liveVoice == "cedar")
 }
 
 @Test func omittedGenderKeepsMarinDefault() throws {
     let data = Data(#"{"name":"Jane Doe","dateOfBirth":"1990-05-20","insurance":"Example Health","additionalDetails":"Morning preferred"}"#.utf8)
-    let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+    let configuration = try JSONDecoder().decode(InputConfiguration.self, from: data)
 
     #expect(configuration.gender == nil)
     #expect(configuration.liveVoice == "marin")
@@ -48,7 +48,7 @@ import Testing
 
 @Test func doctorReferralDetailsSurviveDecodingAndEncoding() throws {
     let data = Data(#"{"name":"Hasini Jayathilaka","dateOfBirth":"1993-09-01","insurance":"TK","additionalDetails":"Mammography appointment","telephoneNumber":"+491772635867","doctorReferralDetails":{"Überweisung":"Radiologie","Diagnose/Verdachtsdiagnose":"Mastodynie links, Beschwerden zunehmen","Auftrag":"Erbitte MammaSono bds., ggf. Mammographie"}}"#.utf8)
-    let configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+    let configuration = try JSONDecoder().decode(InputConfiguration.self, from: data)
 
     #expect(configuration.telephoneNumber == "+491772635867")
     #expect(configuration.doctorReferralDetails?["Überweisung"] == "Radiologie")

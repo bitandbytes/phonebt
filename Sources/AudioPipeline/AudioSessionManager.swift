@@ -86,14 +86,14 @@ public final class AudioSessionManager: @unchecked Sendable {
 
     public func start() throws {
         // Keep line-level phone audio unprocessed; microphone AEC can suppress the remote caller.
-        if #available(macOS 14.0, *) {
-            do {
-                try engine.inputNode.setVoiceProcessingEnabled(false)
-                logger.info("Voice processing (AEC) disabled for line-level call audio")
-            } catch {
-                logger.error("Failed to enable voice processing: \(error)")
-            }
-        }
+//        if #available(macOS 14.0, *) {
+//            do {
+//                try engine.inputNode.setVoiceProcessingEnabled(false)
+//                logger.info("Voice processing (AEC) disabled for line-level call audio")
+//            } catch {
+//                logger.error("Failed to enable voice processing: \(error)")
+//            }
+//        }
 
         try engine.start()
         logger.info("Audio engine started")

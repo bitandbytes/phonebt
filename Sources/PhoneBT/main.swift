@@ -28,8 +28,9 @@ let audioRouter = AudioRouter(preferredDeviceName: callAudioDeviceName)
 var hfpDevice: HFPDevice?
 var discoveredDevices: [DiscoveredDevice] = []
 var audioSessionManager: AudioSessionManager?
-var callSession: CallSession?
+var agentSession: AgentSession?
 var audioStartTask: Task<Void, Never>?
+var hfpEventTask: Task<Void, Never>?
 var activeAudioDevice: AudioDeviceInfo?
 var isRunning = true
 var verboseLogging = ProcessInfo.processInfo.environment["PHONEBT_VERBOSE"] == "1"
@@ -66,8 +67,8 @@ func printHelp() {
 func cleanupCall() {
     audioStartTask?.cancel()
     audioStartTask = nil
-    callSession?.close()
-    callSession = nil
+    agentSession?.close()
+    agentSession = nil
     audioSessionManager?.stop()
     audioSessionManager = nil
     activeAudioDevice = nil
@@ -77,7 +78,10 @@ func cleanupCall() {
 func shutdown() {
     isRunning = false
     cleanupCall()
+    hfpEventTask?.cancel()
+    hfpEventTask = nil
     hfpDevice?.disconnect()
+    hfpDevice = nil
 }
 
 signal(SIGINT) { _ in
@@ -118,6 +122,10 @@ func handleScan() async {
 }
 
 func handleConnect(indexText: String) async {
+    guard hfpDevice == nil else {
+        print("Disconnect the current phone before connecting another one.")
+        return
+    }
     guard let index = Int(indexText), discoveredDevices.indices.contains(index) else {
         print("Invalid device index. Run 'paired' or 'scan' first.")
         return
@@ -129,16 +137,24 @@ func handleConnect(indexText: String) async {
         return
     }
 
+    let stream = device.eventStream.makeStream()
+    let eventTask = Task {
+        for await event in stream { handleEvent(event) }
+    }
+    hfpEventTask?.cancel()
+    hfpEventTask = eventTask
+    hfpDevice = device
+
     print("Connecting to \(selected.name)...")
     do {
         try await device.connect()
-        hfpDevice = device
-        let stream = device.eventStream.makeStream()
-        Task {
-            for await event in stream { handleEvent(event) }
-        }
         print("Connected to \(selected.name).")
     } catch {
+        eventTask.cancel()
+        if hfpDevice === device {
+            hfpDevice = nil
+            hfpEventTask = nil
+        }
         print("Connection failed: \(error.localizedDescription)")
     }
 }
@@ -208,19 +224,19 @@ func handleCall(argument: String) {
         return
     }
 
-    let configuration: CallConfiguration
+    let configuration: InputConfiguration
     do {
         let data = try Data(contentsOf: call.configURL)
-        configuration = try JSONDecoder().decode(CallConfiguration.self, from: data)
+        configuration = try JSONDecoder().decode(InputConfiguration.self, from: data)
     } catch {
-        print("Could not load call configuration: \(error.localizedDescription)")
+        print("Could not load input configuration: \(error.localizedDescription)")
         return
     }
 
     let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
     let resultName = "\(call.configURL.deletingPathExtension().lastPathComponent)-\(timestamp)-appointment-result.json"
     let resultURL = call.configURL.deletingLastPathComponent().appendingPathComponent(resultName)
-    let session = CallSession(
+    let session = AgentSession(
         apiKey: apiKey,
         configuration: configuration,
         resultURL: resultURL,
@@ -230,21 +246,20 @@ func handleCall(argument: String) {
         print("phonebt> ", terminator: "")
         fflush(stdout)
     }
-    callSession = session
+    agentSession = session
 
     do {
         try device.dial(number: call.number)
-        try? device.transferAudioToComputer()
         print("Dialing \(call.number)… GPT-Live will start when the call is answered.")
     } catch {
         session.close(finalizeOutcome: false)
-        callSession = nil
+        agentSession = nil
         print("Dial failed: \(error.localizedDescription)")
     }
 }
 
 func startCallAudioWhenAvailable(attempts: Int = 20) async {
-    guard audioSessionManager == nil, let callSession else { return }
+    guard audioSessionManager == nil, let agentSession else { return }
 
     for _ in 0..<attempts {
         if Task.isCancelled { return }
@@ -254,7 +269,7 @@ func startCallAudioWhenAvailable(attempts: Int = 20) async {
             do {
                 try manager.configure(deviceID: audioDevice.id)
                 try manager.start()
-                try callSession.startAudio(using: manager)
+                try agentSession.startAudio(using: manager)
                 audioSessionManager = manager
                 activeAudioDevice = audioDevice
                 print("GPT-Live audio started on \(audioDevice.name).")
@@ -284,21 +299,18 @@ func handleEvent(_ event: HFPEvent) {
     switch event {
     case .callActive:
         print("\nCall active.")
-        callSession?.prepare()
+        agentSession?.prepare()
         startCallAudio()
-    case .scoConnected:
-        if hfpDevice?.currentState.call == .active {
-            callSession?.prepare()
-            startCallAudio()
-        }
+
     case .callEnded:
         print("\nCall ended.")
         cleanupCall()
-    case .scoDisconnected:
-        if activeAudioDevice?.isBluetooth == true { cleanupCall() }
+
     case .disconnected:
         print("\nPhone disconnected.")
         cleanupCall()
+        hfpEventTask?.cancel()
+        hfpEventTask = nil
         hfpDevice = nil
     case .incomingCall:
         print("\nIncoming calls are not handled by the GPT-Live agent in this version.")
@@ -332,6 +344,14 @@ func handleHangup() {
     }
 }
 
+func handleDisconnect() {
+    cleanupCall()
+    hfpEventTask?.cancel()
+    hfpEventTask = nil
+    hfpDevice?.disconnect()
+    hfpDevice = nil
+}
+
 func handleStatus() {
     guard let device = hfpDevice else {
         print("Connection: disconnected")
@@ -341,7 +361,7 @@ func handleStatus() {
     print("Connection: \(state.connection.rawValue)")
     print("Call: \(state.call.rawValue)")
     print("HFP audio: \(state.audio.rawValue)")
-    print("GPT-Live: \(callSession == nil ? "inactive" : "prepared")")
+    print("GPT-Live: \(agentSession == nil ? "inactive" : "prepared")")
     if let call = state.activeCall {
         print("Number: \(call.number ?? "unknown")")
         if let duration = call.durationDescription { print("Duration: \(duration)") }
@@ -372,10 +392,7 @@ let mainTask = Task {
         case "hangup", "end": handleHangup()
         case "status": handleStatus()
         case "verbose": handleVerbose(argument: argument)
-        case "disconnect":
-            cleanupCall()
-            hfpDevice?.disconnect()
-            hfpDevice = nil
+        case "disconnect": handleDisconnect()
         case "help": printHelp()
         case "quit", "exit", "q":
             print("Goodbye!")

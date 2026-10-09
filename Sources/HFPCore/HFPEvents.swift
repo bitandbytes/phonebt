@@ -33,10 +33,6 @@ public enum HFPEvent: Sendable {
     case callHeld
     case callWaiting(number: String?)
 
-    // Audio events
-    case scoConnected
-    case scoDisconnected
-
     // Indicator events
     case signalStrength(Int)
     case batteryLevel(Int)
